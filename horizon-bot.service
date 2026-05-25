@@ -1,0 +1,30 @@
+[Unit]
+Description=Horizon Bot Beta (V3) — Unified Crystalline Pipeline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/horizon-bot
+
+# Use the virtual environment's python to run main.py
+ExecStart=/home/ubuntu/horizon-bot/venv/bin/python main.py
+
+# Restart logic
+Restart=always
+RestartSec=10
+
+# Load environment variables
+EnvironmentFile=/home/ubuntu/horizon-bot/.env
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=horizon-bot
+
+# Security & Graceful Shutdown
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
