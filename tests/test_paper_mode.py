@@ -293,6 +293,114 @@ def test_full_entry_stop_and_exit_through_the_real_execution_engine(tmp_path, mo
     assert all(x.symbol != symbol for x in eng.state.active_positions)
 
 
+class SteppedPublic(FakePublic):
+    """Rounds amounts down to 0.01 and rejects smaller ones, as the real client does for LINK."""
+
+    def amount_to_precision(self, symbol, amount):
+        rounded = int(float(amount) * 100 + 1e-9) / 100
+        if rounded <= 0:
+            raise ccxt.InvalidOrder(f"amount of {symbol} must be greater than minimum amount precision of 0.01")
+        return f"{rounded:.2f}"
+
+
+def test_partial_close_is_rounded_so_no_dust_outlives_the_stop(broker):
+    public = SteppedPublic()
+    broker.public = public
+    ex = PaperExchange("binance", broker, public_factory=lambda: public)
+    ex.create_order(SYM, "market", "buy", 8.04)
+    ex.create_order(SYM, "market", "sell", 2.412, None, {"reduceOnly": True})
+    assert broker.state["positions"][SYM]["amount"] == pytest.approx(5.63)
+    ex.create_order(SYM, "STOP_MARKET", "sell", 5.63, None, {"stopPrice": 95.0})
+    public.bars = [bar(1, 100, 100, 90, 92)]
+    broker.match(force=True)
+    assert SYM not in broker.state["positions"]
+
+
+def test_amount_below_the_market_step_is_rejected(broker):
+    public = SteppedPublic()
+    broker.public = public
+    ex = PaperExchange("binance", broker, public_factory=lambda: public)
+    with pytest.raises(ccxt.InvalidOrder):
+        ex.create_order(SYM, "market", "buy", 0.008)
+    assert not broker.state["positions"]
+
+
+def test_fill_in_the_current_bar_is_not_dated_in_the_future(broker):
+    long_with_stop(broker)
+    broker.public.bars = [bar(1, 100, 100, 90, 92)]
+    broker.match(force=True)
+    assert broker.state["trades"][-1]["timestamp"] <= time.time() * 1000
+
+
+def test_fill_replayed_from_a_past_bar_keeps_that_bars_time(broker):
+    s, _ = long_with_stop(broker)
+    earlier = int(time.time() * 1000) - 10 * MINUTE_MS
+    broker.state["orders"][s["id"]]["created_ms"] = earlier
+    broker.state["last_checked"][SYM] = earlier
+    past = bar(-5, 100, 100, 90, 92)
+    broker.public.bars = [past]
+    broker.match(force=True)
+    assert broker.state["trades"][-1]["timestamp"] == past[0] + MINUTE_MS - 1
+
+
+@pytest.fixture
+def watched_position(tmp_path):
+    from data_handler import DataHandler
+    from execution_engine import ExecutionEngine
+    from state_engine import StateEngine
+    from utils.event_sourced_runtime import OwnershipRegistry
+    from utils.schemas import TradeSignal
+    symbol = "PAPERWATCHUSDT"
+    b = PaperBroker(str(tmp_path / "b.json"), initial=1000.0, fee=0.001, slippage_bps=10.0, match_interval_s=0.0)
+    public = FakePublic()
+    b.public = public
+    dh = DataHandler()
+    dh._local.instance = PaperExchange("binance", b, public_factory=lambda: public)
+    eng = ExecutionEngine(dh, simulation_mode=False)
+    eng.state = StateEngine()
+    eng.pending_sl.pop(symbol, None)    # the 2-second duplicate guard would otherwise see the previous test's stop
+    pos = eng.execute_trade(symbol, TradeSignal(symbol=symbol, trigger="LONG", confidence=1.0), 1.0, 95.0, 0.0)
+    assert pos.stop_loss == 95.0
+    yield eng, pos, b, public, dh.format_symbol(symbol)
+    eng.pending_sl.pop(symbol, None)
+    OwnershipRegistry().get_owner(symbol).submit_event("POSITION_CLOSED", {})
+
+
+def test_watchdog_places_no_stop_for_a_position_its_stop_just_closed(watched_position):
+    eng, pos, b, public, formatted = watched_position
+    eng.pending_sl[pos.symbol]["timestamp"] = 0     # the stop was placed long ago, past the duplicate guard
+    public.bars = [bar(1, 100, 100, 90, 92)]
+    eng.watchdog_verify_sl(pos)     # the position snapshot predates the fill found by this call
+    assert not b.state["positions"]
+    assert len([o for o in b.fetch_orders(formatted) if o["type"] == "STOP_MARKET"]) == 1
+
+
+def test_watchdog_still_restores_a_missing_stop_on_an_open_position(watched_position):
+    eng, pos, b, public, formatted = watched_position
+    b.cancel_all_orders(formatted)
+    eng.pending_sl.pop(pos.symbol, None)
+    eng.watchdog_verify_sl(pos)
+    assert [o["type"] for o in b.fetch_open_orders(formatted)] == ["STOP_MARKET"]
+
+
+def test_watchdog_restores_the_stop_when_the_position_check_fails(watched_position, monkeypatch):
+    eng, pos, b, public, formatted = watched_position
+    b.cancel_all_orders(formatted)
+    eng.pending_sl.pop(pos.symbol, None)
+    real = eng.dh.fetch_active_positions
+    calls = []
+
+    def fail_first(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("exchange did not answer")
+        return real(*a, **k)
+
+    monkeypatch.setattr(eng.dh, "fetch_active_positions", fail_first)
+    eng.watchdog_verify_sl(pos)
+    assert [o["type"] for o in b.fetch_open_orders(formatted)] == ["STOP_MARKET"]
+
+
 def test_report_counts_closes_fees_and_drawdown(broker):
     sys.path.insert(0, os.path.join(REPO, "scripts"))
     from paper_report import render, summarize

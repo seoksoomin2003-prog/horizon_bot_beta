@@ -227,7 +227,8 @@ class PaperBroker:
                     continue
                 px = self._trigger_price(order, o, h, l)
                 if px is not None and order["id"] in self.state["orders"]:
-                    self._apply_trigger(order, px, t + MINUTE_MS - 1)
+                    # The current bar ends in the future; a fill cannot be dated later than now.
+                    self._apply_trigger(order, px, min(now, t + MINUTE_MS - 1))
                     changed = True
             self._marks[sym] = float(bar[4])
         if bars:
@@ -326,7 +327,7 @@ class PaperBroker:
 _PUBLIC = frozenset({"load_markets", "markets", "market", "amount_to_precision", "price_to_precision", "fetch_ohlcv",
                      "fetch_ticker", "fetch_order_book", "load_time_difference", "milliseconds_offset", "milliseconds",
                      "symbols", "id", "has", "timeframes", "fetch_time", "iso8601", "parse8601"})
-_ACCOUNT = frozenset({"create_order", "cancel_order", "cancel_all_orders", "fetch_open_orders", "fetch_order", "fetch_orders",
+_ACCOUNT = frozenset({"cancel_order", "cancel_all_orders", "fetch_open_orders", "fetch_order", "fetch_orders",
                       "fetch_my_trades", "fetch_balance", "fetch_positions"})
 
 
@@ -352,6 +353,11 @@ class PaperExchange:
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise PaperBlocked(f"paper mode blocks setting exchange attribute {name!r}")
+
+    def create_order(self, symbol: str, type: str, side: str, amount: Any, price: Any = None,
+                     params: Optional[dict] = None) -> dict:
+        # Real ccxt clients round the amount here, and reject one below the market's step.
+        return self._broker.create_order(symbol, type, side, self._public.amount_to_precision(symbol, amount), price, params)
 
     def set_position_mode(self, *args: Any, **kwargs: Any) -> dict:
         return {"paper": True}

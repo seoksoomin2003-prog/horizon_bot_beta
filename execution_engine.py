@@ -1046,6 +1046,13 @@ class ExecutionEngine:
         """atomic stop update wrapper."""
         return self.atomic_stop_update(symbol, pos, pos.stop_loss)
 
+    def _position_already_closed(self, symbol) -> bool:
+        """True only when the exchange answers and has no such position. If it cannot answer, recovery goes ahead."""
+        try:
+            return all(p.symbol != symbol for p in self.dh.fetch_active_positions(retries=2))
+        except Exception:
+            return False
+
     def watchdog_verify_sl(self, positions):
         """
         [WATCHDOG] Periodically verifies all active positions have an SL on exchange.
@@ -1076,8 +1083,11 @@ class ExecutionEngine:
                 has_sl = any(is_protection_order(o, pos) for o in orders)
                 
                 if not has_sl:
-                    trades_logger.warning(f"[WATCHDOG] Missing SL detected for {symbol}. Attempting recovery...")
-                    if hasattr(pos, "stop_loss") and pos.stop_loss > 0:
+                    if self._position_already_closed(symbol):
+                        # The stop fired after this position snapshot was taken: nothing is left to protect.
+                        trades_logger.info(f"[WATCHDOG] {symbol} has no SL because the position is already closed.")
+                    elif hasattr(pos, "stop_loss") and pos.stop_loss > 0:
+                        trades_logger.warning(f"[WATCHDOG] Missing SL detected for {symbol}. Attempting recovery...")
                         self.place_stop_loss(symbol, pos.side, pos.amount, pos.stop_loss)
                     else:
                         errors_logger.critical(f"[WATCHDOG] Cannot recover SL for {symbol}. EMERGENCY CLOSE.")
