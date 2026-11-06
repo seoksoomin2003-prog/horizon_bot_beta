@@ -1,10 +1,14 @@
 {
   "LTCUSDT": {
-    "timestamp": 1779706334.346452,
-    "price": 90.0
+    "timestamp": 1779711353.2759418,
+    "price": 90.0,
+    "status": "CONFIRMED",
+    "order_id": "sync_sl_order"
   },
   "BTCUSDT": {
-    "timestamp": 1779706335.982114,
-    "price": 95.0
+    "timestamp": 1779969729.4403431,
+    "price": 90.0,
+    "status": "CONFIRMED",
+    "order_id": "12345"
   }
 }

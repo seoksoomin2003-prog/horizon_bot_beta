@@ -21,7 +21,8 @@ class DegradedExchangeManager:
     """
     _instance = None
     _lock = threading.Lock()
-    STATE_FILE = "data/degradation_state.json"
+    from utils.persistence import get_absolute_path
+    STATE_FILE = get_absolute_path("degradation_state.json")
 
     def __new__(cls, *args, **kwargs):
         with cls._lock:

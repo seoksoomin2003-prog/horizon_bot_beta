@@ -4,6 +4,7 @@ import numpy as np
 import ccxt
 import time
 import config
+from utils.runtime_coordinator import RuntimeCoordinator
 import threading
 from logger import trades_logger, errors_logger
 from utils.safe_core import SafeCore
@@ -17,12 +18,16 @@ class DataHandler:
         self.exchange_name = config.EXCHANGE
         self._local = threading.local()
         
+        from adapters import get_adapter
+        self.adapter = get_adapter(self.exchange_name)
+        
         # Prepare thread-safe exchange configuration
         if self.exchange_name == "binance":
             self._exchange_config = {
                 'apiKey': config.BINANCE_API_KEY,
                 'secret': config.BINANCE_API_SECRET,
                 'enableRateLimit': True,
+                'timeout': 10000,
                 'options': {
                     'defaultType': 'future'
                 }
@@ -33,6 +38,7 @@ class DataHandler:
                 'secret': config.BITGET_API_SECRET,
                 'password': config.BITGET_PASSPHRASE,
                 'enableRateLimit': True,
+                'timeout': 10000,
                 'options': {
                     'defaultType': 'swap'
                 }
@@ -43,12 +49,13 @@ class DataHandler:
         trades_logger.info(f"Using exchange: {self.exchange_name.upper()}")
         self.last_equity = 0.0
         self.last_used_margin = 0.0
+
+    def initialize_exchange_connection(self):
+        """Perform all blocking network setup and validation routines."""
         self.validate_api_keys()
-        self._safe_load_markets() # Robust init
-        
-        # [FIX] Enforce configured position mode at startup
-        if self.exchange_name == "bitget":
-            self.enforce_bitget_position_mode()
+        self._safe_load_markets()
+        if hasattr(self, "adapter") and self.adapter is not None:
+            self.adapter.enforce_position_mode(self.exchange, config.POSITION_MODE, config.SYMBOLS, self.format_symbol)
 
     @property
     def exchange(self):
@@ -64,30 +71,36 @@ class DataHandler:
                 # [FIX] Time Synchronization
                 inst.options["adjustForTimeDifference"] = True
             
+            if hasattr(self, "adapter") and self.adapter is not None:
+                if hasattr(self.adapter, "patch_exchange"):
+                    self.adapter.patch_exchange(inst)
+
             self._local.instance = inst
         return self._local.instance
 
     def _safe_load_markets(self):
         """[C8] Exponential Backoff Market Loading (Daemon Mode)."""
         attempt = 0
-        while True:
+        max_attempts = 5
+        while attempt < max_attempts:
             try:
                 self.exchange.load_markets()
                 trades_logger.info(f"[OK] Markets loaded on attempt {attempt+1}")
                 self.validate_supported_markets()
-                config.BOT_STATE['system_state'] = 'NORMAL'
-                config.BOT_STATE['allow_data_polling'] = True
-                config.BOT_STATE['trading_enabled'] = True
+                RuntimeCoordinator().set_state("system_state", 'NORMAL')
+                RuntimeCoordinator().set_state("allow_data_polling", True)
+                RuntimeCoordinator().set_state("trading_enabled", True)
                 return
             except Exception as e:
                 backoff = min(60, 2 ** attempt)
-                errors_logger.warning(f"Market load failed ({attempt+1}). Retrying in {backoff}s: {e}")
+                errors_logger.warning(f"Market load failed ({attempt+1}/{max_attempts}). Retrying in {backoff}s: {e}")
                 
-                if attempt >= 4:
-                    errors_logger.critical("EXCH_INIT_FAIL: Entering DEGRADED state. Daemon keeps retrying.")
-                    config.BOT_STATE['system_state'] = 'DEGRADED'
-                    config.BOT_STATE['allow_data_polling'] = False
-                    config.BOT_STATE['trading_enabled'] = False
+                if attempt >= max_attempts - 1:
+                    errors_logger.critical("EXCH_INIT_FAIL: Bounded startup retries exhausted. Entering DEGRADED startup mode.")
+                    RuntimeCoordinator().set_state("system_state", 'DEGRADED')
+                    RuntimeCoordinator().set_state("allow_data_polling", False)
+                    RuntimeCoordinator().set_state("trading_enabled", False)
+                    return
                 
                 time.sleep(backoff)
                 attempt += 1
@@ -110,26 +123,43 @@ class DataHandler:
         # Override runtime SYMBOLS safely
         if len(valid_symbols) == 0:
             errors_logger.critical("[CRITICAL] No valid markets found. Trading disabled.")
-            config.BOT_STATE['trading_enabled'] = False
+            RuntimeCoordinator().set_state("trading_enabled", False)
         
         config.SYMBOLS = valid_symbols
-        config.BOT_STATE['active_symbols'] = valid_symbols
+        RuntimeCoordinator().set_state("active_symbols", valid_symbols)
 
     def validate_api_keys(self):
         """[PHASE 2] API Validation Guard."""
-        try:
-            balance = self.exchange.fetch_balance()
-            if balance is None:
-                raise ValueError("Balance returned None")
-            trades_logger.info("[OK] API Keys validated and permissions are active.")
-        except Exception as e:
+        import ccxt
+        attempt = 0
+        max_attempts = 3
+        while attempt < max_attempts:
             try:
-                from utils.telegram_commands import send_message
-                send_message("🚨 <b>CRITICAL_CONFIG_ERROR</b>\nAPI Invalid, lacks permissions, or IP not whitelisted.")
-            except:
-                pass
-            errors_logger.critical(f"CRITICAL_CONFIG_ERROR: API Invalid or IP not whitelisted: {e}")
-            raise RuntimeError(f"CRITICAL_CONFIG_ERROR: {e}")
+                balance = self.exchange.fetch_balance()
+                if balance is None:
+                    raise ValueError("Balance returned None")
+                trades_logger.info("[OK] API Keys validated and permissions are active.")
+                return
+            except (ccxt.AuthenticationError, ccxt.PermissionDenied) as auth_err:
+                try:
+                    from utils.telegram_commands import send_message
+                    send_message(f"🚨 <b>CRITICAL_CONFIG_ERROR</b>\nAPI credentials rejected: {auth_err}")
+                except:
+                    pass
+                errors_logger.critical(f"CRITICAL_CONFIG_ERROR: API credentials rejected: {auth_err}")
+                raise RuntimeError(f"CRITICAL_CONFIG_ERROR: {auth_err}")
+            except Exception as e:
+                attempt += 1
+                backoff = 2 ** attempt
+                errors_logger.warning(f"API key validation attempt {attempt}/{max_attempts} failed: {e}")
+                if attempt < max_attempts:
+                    time.sleep(backoff)
+                else:
+                    errors_logger.critical(f"EXCH_INIT_FAIL: API key validation failed after {max_attempts} attempts. Entering DEGRADED startup mode.")
+                    RuntimeCoordinator().set_state("system_state", 'DEGRADED')
+                    RuntimeCoordinator().set_state("allow_data_polling", False)
+                    RuntimeCoordinator().set_state("trading_enabled", False)
+                    return
 
     def format_symbol(self, symbol):
         """
@@ -143,13 +173,8 @@ class DataHandler:
                 base = symbol.replace('USDT', '')
                 symbol = f"{base}/USDT"
         
-        if self.exchange_name == "binance":
-            return symbol # CCXT binance handles BTC/USDT or BTCUSDT
-        elif self.exchange_name == "bitget":
-            # Bitget Futures in CCXT often expects BTC/USDT:USDT
-            if ':' not in symbol:
-                return f"{symbol}:USDT"
-            return symbol
+        if hasattr(self, "adapter") and self.adapter is not None:
+            return self.adapter.format_symbol(symbol)
         return symbol
 
     def validate_ohlcv(self, df):
@@ -289,11 +314,16 @@ class DataHandler:
         """
         try:
             balance = self.exchange.fetch_balance()
-            return Validator.balance(balance)
+            acc_state = Validator.balance(balance)
+            self.last_equity = acc_state.equity
+            self.last_used_margin = acc_state.used_margin
+            return acc_state
         except Exception as e:
-            # Fallback to cached equity if possible, otherwise raise
             errors_logger.error(f"Account State Integrity Failure: {e}")
-            return AccountState(equity=self.last_equity, used_margin=self.last_used_margin)
+            from utils.degraded_manager import DegradedExchangeManager
+            DegradedExchangeManager().report_failure(f"Account State fetch failure: {e}")
+            from utils.schemas import ACCOUNT_STATE_UNAVAILABLE
+            return ACCOUNT_STATE_UNAVAILABLE
 
     def get_used_margin(self):
         """[POLICY 1] Institutional Margin Monitoring."""
@@ -318,76 +348,11 @@ class DataHandler:
     def get_position_mode(self, symbol=None):
         """
         Returns 'hedge' or 'one_way' aligned with config.POSITION_MODE.
-        Safe detection with Bitget V2 Fallback.
         """
-        if self.exchange_name != "bitget":
-            return None
-            
-        from config import SYMBOLS
-        sym = self.format_symbol(symbol or SYMBOLS[0])
-        
-        try:
-            self.exchange.load_markets()
-            # 1. Attempt Unified CCXT method
-            if self.exchange.has.get('fetchPositionMode'):
-                raw = self.exchange.fetch_position_mode(sym)
-                if isinstance(raw, dict):
-                    hedged = raw.get('hedged')
-                    if hedged is True: return 'hedge'
-                    if hedged is False: return 'one_way'
-            
-            # 2. FALLBACK - Bitget V2 API [PART 1 HARDENING]
-            # CCXT naming: private_mix_get_v2_mix_account_account (or similar depending on version)
-            # We use a robust lookup to avoid attribute errors
-            fallback_methods = [
-                'private_mix_get_v2_mix_account_account',
-                'private_get_v2_mix_account_account',
-                'privateGetV2MixAccountAccount'
-            ]
-            
-            method = None
-            for m in fallback_methods:
-                if hasattr(self.exchange, m):
-                    method = getattr(self.exchange, m)
-                    break
-            
-            if method:
-                # Bitget V2 account endpoint requires marginCoin, NOT symbol
-                response = method({"productType": "USDT-FUTURES", "marginCoin": "USDT"})
-                data = response.get("data", {})
-                hold_mode = data.get("holdMode") # 'single_hold' or 'double_hold'
-                
-                if hold_mode == "single_hold": return "one_way"
-                if hold_mode == "double_hold": return "hedge"
-            
-            return None
+        mode = self.adapter.get_position_mode(self.exchange)
+        # Normalize returned mode string to 'one_way' or 'hedge'
+        if mode == 'oneway':
+            return 'one_way'
+        return mode
 
-        except Exception as e:
-            errors_logger.error(f"[ERROR] Bitget Position Mode Detection Failed: {e}")
-            return None
 
-    def enforce_bitget_position_mode(self):
-        """
-        Force the configured position mode on Bitget for all symbols.
-        """
-        if self.exchange_name != "bitget":
-            return
-
-        from config import POSITION_MODE, SYMBOLS
-        is_hedged = True if POSITION_MODE == "hedge" else False
-        mode_text = POSITION_MODE.upper()
-
-        trades_logger.info(f"Enforcing {mode_text} position mode on Bitget...")
-        for symbol in SYMBOLS:
-            formatted_symbol = self.format_symbol(symbol)
-            try:
-                # CCXT unified method: set_position_mode(hedged=bool)
-                self.exchange.set_position_mode(is_hedged, formatted_symbol)
-                trades_logger.info(f"Position mode confirmed {mode_text} for {symbol}")
-            except Exception as e:
-                # Fails if already set, which is fine
-                error_str = str(e).lower()
-                if "already" in error_str or "no change" in error_str or "30030" in error_str:
-                    trades_logger.info(f"{symbol} already in {mode_text} mode.")
-                else:
-                    errors_logger.warning(f"Could not enforce {mode_text} mode for {symbol}: {e}")

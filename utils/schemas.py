@@ -9,6 +9,10 @@ class Ticker:
     ask: float = 0.0
     timestamp: float = 0.0
 
+    def __post_init__(self):
+        from utils.validator import normalize_symbol
+        object.__setattr__(self, 'symbol', normalize_symbol(self.symbol))
+
 @dataclass
 class PositionSchema:
     symbol: str
@@ -46,6 +50,12 @@ class PositionSchema:
     timestamp: float = 0.0
     last_sync_ts: float = 0.0
     entry_time: str = ""
+    tp1_order_id: Optional[str] = None
+    tp2_order_id: Optional[str] = None
+
+    def __post_init__(self):
+        from utils.validator import normalize_symbol
+        self.symbol = normalize_symbol(self.symbol)
 
 @dataclass(frozen=True)
 class TradeSignal:
@@ -56,12 +66,34 @@ class TradeSignal:
     regime: str = 'RANGE'
     trend_bias: Optional[str] = None
 
+    def __post_init__(self):
+        from utils.validator import normalize_symbol
+        object.__setattr__(self, 'symbol', normalize_symbol(self.symbol))
+
+from enum import Enum
+
+class EquityState(str, Enum):
+    VALID = "VALID"
+    UNAVAILABLE = "UNAVAILABLE"
+    STALE = "STALE"
+
 @dataclass(frozen=True)
 class AccountState:
     equity: float = 0.0
     used_margin: float = 0.0
     available_balance: float = 0.0
     timestamp: float = 0.0
+    is_available: bool = True
+    equity_state: EquityState = EquityState.VALID
+
+ACCOUNT_STATE_UNAVAILABLE = AccountState(
+    equity=0.0,
+    used_margin=0.0,
+    available_balance=0.0,
+    timestamp=0.0,
+    is_available=False,
+    equity_state=EquityState.UNAVAILABLE
+)
 
 @dataclass(frozen=True)
 class PerformanceTrade:

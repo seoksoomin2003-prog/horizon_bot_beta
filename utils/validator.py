@@ -4,11 +4,22 @@ from utils.safe_core import SafeCore
 from utils.exceptions import DataIntegrityError
 import time
 
+def normalize_symbol(symbol: str) -> str:
+    if not symbol:
+        return ""
+    # Centralized normalization: map e.g. BTC/USDT or BTC/USDT:USDT to BTCUSDT
+    s = str(symbol).upper()
+    if ":" in s:
+        s = s.split(":")[0]
+    s = s.replace("/", "")
+    return s
+
 class Validator:
     @staticmethod
     def ticker(raw: Any, symbol: str) -> Ticker:
         """API -> TICKER typed object."""
         raw = SafeCore.ensure_dict(raw)
+        symbol = normalize_symbol(symbol)
         if not raw:
             raise DataIntegrityError(f"Empty ticker for {symbol}")
         
@@ -31,7 +42,7 @@ class Validator:
     def position(raw: Any) -> PositionSchema:
         """API -> POSITION typed object."""
         raw = SafeCore.ensure_dict(raw)
-        symbol = raw.get('symbol')
+        symbol = normalize_symbol(raw.get('symbol'))
         if not symbol:
             raise DataIntegrityError("Position data missing symbol")
             
@@ -59,7 +70,10 @@ class Validator:
                 side = 'LONG'
             else:
                 # Failsafe for zero or ambiguous state
-                raise DataIntegrityError(f"UNABLE TO DETERMINE POSITION SIDE: Raw Side '{raw_side}' is ambiguous")
+                if abs(contracts) == 0.0:
+                    side = 'LONG'
+                else:
+                    raise DataIntegrityError(f"UNABLE TO DETERMINE POSITION SIDE: Raw Side '{raw_side}' is ambiguous")
         
         return PositionSchema(
             symbol=symbol,

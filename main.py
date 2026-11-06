@@ -11,6 +11,7 @@ from logger import trades_logger, errors_logger
 
 # 1. CORE ENGINES (Unified v3)
 import config
+from utils.runtime_coordinator import RuntimeCoordinator
 from data_handler import DataHandler
 from signal_engine import SignalEngine
 from conviction_engine import ConvictionEngine
@@ -24,25 +25,19 @@ from utils.invariants_v2 import InvariantsV2
 def run_v3():
     trades_logger.info("Initializing Horizon Bot v3 [FULL RECONSTRUCTION]...")
     
-    import config
-    STOP_FLAG_PATH = "/tmp/trading_bot.stop"
+    from utils.persistence import get_absolute_path
+    STOP_FLAG_PATH = get_absolute_path("trading_bot.stop")
     if os.path.exists(STOP_FLAG_PATH):
-        config.BOT_STATE["is_running"] = False
+        RuntimeCoordinator().set_state("is_running", False)
         trades_logger.warning("STOP FLAG DETECTED — BOT STARTING IN PAUSED MODE")
 
     # A. Environment & Safety Audit
-    LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'horizon.lock')
-    if InvariantsV2.audit_process_lock(LOCK_PATH):
-        try:
-            with open(LOCK_PATH, 'r') as f:
-                pid = int(f.read().strip())
-            # Check if process is actually alive
-            os.kill(pid, 0)
-            trades_logger.critical(f"Another process detected (PID {pid}) — HALT")
-            sys.exit(1)
-        except (ValueError, ProcessLookupError, OSError):
-            trades_logger.warning("Stale lock detected. Auto-clearing system lock.")
-            os.remove(LOCK_PATH)
+    from utils.persistence import get_absolute_path, ProcessLock
+    LOCK_PATH = get_absolute_path("horizon.lock")
+    process_lock = ProcessLock(LOCK_PATH)
+    if not process_lock.acquire():
+        trades_logger.critical(f"Failed to acquire exclusive system lock. Dual live instance prevented. Halt.")
+        sys.exit(1)
 
     # Credential Check for Live Mode
     if not config.DEMO_MODE:
@@ -50,13 +45,8 @@ def run_v3():
         if not active_key or "your_" in active_key:
             trades_logger.critical(f"!!! LIVE MODE DETECTED WITH MISSING/PLACEHOLDER KEYS [{config.EXCHANGE.upper()}] !!!")
             trades_logger.critical("Check your .env file and replace placeholders with real API keys.")
+            process_lock.release()
             sys.exit(1)
-
-    # create lock AFTER check
-    if not os.path.exists(os.path.dirname(LOCK_PATH)):
-        os.makedirs(os.path.dirname(LOCK_PATH))
-    with open(LOCK_PATH, 'w') as f:
-        f.write(str(os.getpid()))
 
     try:
         # B. Dependency Injection
@@ -74,6 +64,7 @@ def run_v3():
         
         state = StateEngine()
         execution.state = state
+        execution.recover_pending_sl_registry()
 
         # C. Pipeline Orchestration
         bot_pipeline = Pipeline(
@@ -89,13 +80,53 @@ def run_v3():
         # D. Start Telegram C2
         from utils.telegram_commands import start_telegram_listener, send_message
         start_telegram_listener(pos_manager=state, execution_engine=execution, dh=dh)
-        send_message("🚀 <b>Horizon Bot V3 Online</b>\nLive Execution Pipeline Active.")
+        send_message("🚀 <b>Horizon Bot V3 Online</b>\nInitializing connection to exchange...")
 
+        # Initialize connection (blocking/bounded setup calls)
+        dh.initialize_exchange_connection()
+
+        send_message("✅ <b>Exchange Connection Initialized</b>\nLive Execution Pipeline Active.")
         trades_logger.info("V3 System Active. Main Loop Started [LIVE MODE].")
 
         # D. Continuous Execution Pipeline
         while True:
-            if not config.BOT_STATE.get('is_running', True):
+            # Process Telegram Commands
+            for cmd_obj in RuntimeCoordinator().drain_commands():
+                cmd = cmd_obj.get("command")
+                if cmd == "PAUSE":
+                    RuntimeCoordinator().set_state("is_running", False)
+                    RuntimeCoordinator().set_state("stop_mode", "pause_only")
+                    try:
+                        from utils.persistence import get_absolute_path
+                        with open(get_absolute_path("trading_bot.stop"), "w") as f:
+                            f.write("STOP")
+                    except Exception: pass
+                    send_message("[STOP] BOT STOPPED\nTrading halted.", priority=0)
+                elif cmd == "STOP_ALL":
+                    RuntimeCoordinator().set_state("is_running", False)
+                    RuntimeCoordinator().set_state("stop_mode", "close_all_and_stop")
+                    try:
+                        from utils.persistence import get_absolute_path
+                        with open(get_absolute_path("trading_bot.stop"), "w") as f:
+                            f.write("STOP")
+                    except Exception: pass
+                    try:
+                        if state:
+                            state.close_all_positions(execution, dh)
+                        send_message("[STOP] BOT STOPPED\nAll positions closed.", priority=0)
+                    except Exception as e:
+                        send_message(f"[ERROR] Emergency close failed: {e}", priority=0)
+                elif cmd == "RESUME":
+                    RuntimeCoordinator().set_state("is_running", True)
+                    try:
+                        from utils.persistence import get_absolute_path
+                        path = get_absolute_path("trading_bot.stop")
+                        if os.path.exists(path):
+                            os.remove(path)
+                    except Exception: pass
+                    send_message("[START] BOT STARTED\nTrading resumed.", priority=0)
+
+            if not RuntimeCoordinator().get_state('is_running', True):
                 trades_logger.warning("BOT PAUSED — skipping execution cycle")
                 time.sleep(1.0)
                 continue
@@ -114,8 +145,7 @@ def run_v3():
     except Exception as e:
         errors_logger.critical(f"UNRECOVERABLE SYSTEM CRASH: {e}", exc_info=True)
     finally:
-        if os.path.exists(LOCK_PATH):
-            os.remove(LOCK_PATH)
+        process_lock.release()
         trades_logger.info("System Halted.")
 
 if __name__ == "__main__":

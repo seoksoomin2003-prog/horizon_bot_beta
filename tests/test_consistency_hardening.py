@@ -282,5 +282,56 @@ class TestConsistencyHardening(unittest.TestCase):
         self.assertFalse(snap.get("tp1_done"))
         print("[PASS] Journal replay successfully converged and alignment remained 100% deterministic.")
 
+    def test_11_entry_pending_protection_lifecycle(self):
+        print("\n--- [TEST-11] ENTRY_PENDING_PROTECTION lifecycle ---")
+        pos = PositionSchema(
+            symbol="BTCUSDT", side="LONG", amount=1.0, initial_amount=1.0,
+            entry_price=10000.0, stop_loss=0.0, status="open"
+        )
+        state = derive_lifecycle_state(pos)
+        self.assertEqual(state, LifecycleState.ENTRY_PENDING_PROTECTION.value)
+        print("[PASS] Position with stop_loss=0 correctly derived as ENTRY_PENDING_PROTECTION.")
+
+    def test_12_partial_fill_exposure_tracking(self):
+        print("\n--- [TEST-12] Partial fill exposure tracking ---")
+        pos = PositionSchema(
+            symbol="ETHUSDT", side="LONG", amount=5.0, initial_amount=5.0,
+            entry_price=2000.0, stop_loss=1900.0, status="open",
+            lifecycle_state="PARTIAL"
+        )
+        setattr(pos, "entry_order_id", "order_123")
+        state = derive_lifecycle_state(pos)
+        self.assertEqual(state, LifecycleState.PARTIAL.value)
+        print("[PASS] Position in PARTIAL state correctly derived as PARTIAL.")
+
+    def test_13_task_lease_timeout_abandonment(self):
+        print("\n--- [TEST-13] Task lease timeout abandonment ---")
+        from utils.retry_scheduler import TaskLease, TaskAbandonRegistry
+        
+        lease_id = "test_lease_456"
+        TaskLease.set_lease(lease_id)
+        TaskLease.verify_active()
+        
+        TaskAbandonRegistry.abandon(lease_id)
+        with self.assertRaises(RuntimeError):
+            TaskLease.verify_active()
+            
+        TaskLease.set_lease(None)
+        print("[PASS] Abandoned lease blocked from execution.")
+
+    def test_14_worker_generation_ownership(self):
+        print("\n--- [TEST-14] Worker generation ownership ---")
+        from utils.retry_scheduler import WorkerGenerationRegistry
+        
+        symbol = "SOLUSDT"
+        WorkerGenerationRegistry.set_active_generation(symbol, "ENTRY", "gen_active")
+        WorkerGenerationRegistry.set_thread_generation(symbol, "ENTRY", "gen_stale")
+        
+        with self.assertRaises(RuntimeError):
+            WorkerGenerationRegistry.verify_active()
+            
+        WorkerGenerationRegistry.set_thread_generation(None, None, None)
+        print("[PASS] Stale worker generation blocked from state mutation.")
+
 if __name__ == '__main__':
     unittest.main()

@@ -5,6 +5,7 @@ import queue
 import httpx
 from datetime import datetime
 import config
+from utils.runtime_coordinator import RuntimeCoordinator
 from logger import errors_logger, trades_logger
 
 MAX_RETRIES = 5
@@ -30,11 +31,12 @@ class TelegramMessage:
 
 class TelegramManager:
     def __init__(self):
-        self.msg_queue = queue.PriorityQueue()
+        self.msg_queue = queue.PriorityQueue(maxsize=100)
         self.worker_thread = None
         self.listener_thread = None
         self.stop_event = threading.Event()
         self._last_send_time = 0
+        self._lock = threading.Lock()
 
     @property
     def is_active(self) -> bool:
@@ -70,16 +72,55 @@ class TelegramManager:
 
     def send(self, text: str, priority: int = 1):
         """
-        Public non-blocking API to queue a message.
+        Public non-blocking API to queue a message with backpressure and dropping policy.
         """
         if not self.is_active:
             return
             
         msg = TelegramMessage(text, priority)
-        try:
-            self.msg_queue.put(msg, block=False)
-        except queue.Full:
-            errors_logger.error("Telegram Queue FULL! Dropping message.")
+        with self._lock:
+            if self.msg_queue.full():
+                if priority == 0:
+                    # Emergency message: drop a normal priority message to make room!
+                    items = []
+                    while not self.msg_queue.empty():
+                        try:
+                            items.append(self.msg_queue.get_nowait())
+                        except queue.Empty:
+                            break
+                            
+                    # Sort items by priority desc (lowest priority 1 first) then timestamp desc (oldest first)
+                    items.sort(key=lambda x: (-x.priority, x.timestamp))
+                    
+                    dropped = False
+                    if items and items[0].priority > 0:
+                        dropped_msg = items.pop(0)
+                        errors_logger.warning(f"Telegram Queue Full! Dropped normal-priority message to accommodate emergency message: {dropped_msg.text[:50]}")
+                        dropped = True
+                        
+                    # Re-queue remaining items non-blockingly
+                    for item in items:
+                        try:
+                            self.msg_queue.put(item, block=False)
+                        except queue.Full:
+                            errors_logger.warning(f"Telegram queue full while re-queueing. Dropping message: {item.text[:50]}")
+                        
+                    if not dropped:
+                        # If queue is somehow filled entirely with emergency messages, drop oldest
+                        try:
+                            oldest = self.msg_queue.get_nowait()
+                            errors_logger.warning(f"Telegram Queue full of emergency messages. Dropped oldest emergency: {oldest.text[:50]}")
+                        except queue.Empty:
+                            pass
+                else:
+                    # Normal priority and queue is full -> Drop it!
+                    errors_logger.warning(f"Telegram Queue Full! Dropped normal-priority message: {text[:50]}")
+                    return
+            
+            try:
+                self.msg_queue.put(msg, block=False)
+            except queue.Full:
+                errors_logger.error("Telegram Queue FULL! Dropping message.")
 
     def _sender_loop(self):
         """
@@ -97,16 +138,21 @@ class TelegramManager:
             if success:
                 self.msg_queue.task_done()
             else:
-                # Handle retry logic
+                # Handle non-blocking retry logic using threading.Timer to achieve retry isolation
                 if msg.retries < MAX_RETRIES:
                     msg.retries += 1
                     backoff = min(INITIAL_BACKOFF * (2 ** (msg.retries - 1)), MAX_BACKOFF)
                     errors_logger.warning(f"Retrying Telegram message in {backoff}s (Attempt {msg.retries}/{MAX_RETRIES})")
                     
-                    # Re-queue after delay (we use a separate thread or just sleep here since it's the sender loop)
-                    # For simplicity in this worker, we sleep. Real production might use a scheduler.
-                    time.sleep(backoff)
-                    self.msg_queue.put(msg)
+                    # Re-queue after delay non-blockingly using a Timer!
+                    def re_queue():
+                        with self._lock:
+                            try:
+                                self.msg_queue.put(msg, block=False)
+                            except queue.Full:
+                                errors_logger.error("Telegram Queue full during retry re-queue. Dropping message.")
+                    threading.Timer(backoff, re_queue).start()
+                    self.msg_queue.task_done()
                 else:
                     errors_logger.critical(f"PERMANENT FAILURE: Telegram message dropped after {MAX_RETRIES} retries. Contents: {msg.text[:50]}...")
                     # Dead-letter log
@@ -158,7 +204,9 @@ class TelegramManager:
 
     def _log_to_dead_letter(self, msg: TelegramMessage):
         try:
-            with open("logs/failed_notifications.log", "a") as f:
+            from utils.persistence import get_absolute_path
+            log_path = get_absolute_path("logs", "failed_notifications.log")
+            with open(log_path, "a") as f:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 f.write(f"[{timestamp}] PRIO={msg.priority} MSG={msg.text}\n")
         except:
@@ -226,12 +274,12 @@ class TelegramManager:
 
         elif cmd == "/status":
             active_pos_count = len(pos_manager.active_positions) if pos_manager else 0
-            is_running_str = "YES" if config.BOT_STATE["is_running"] else "NO (PAUSED)"
+            is_running_str = "YES" if RuntimeCoordinator().get_state("is_running") else "NO (PAUSED)"
             status_msg = (
                 f"BOT STATUS\n"
                 f"Running: {is_running_str}\n"
                 f"Positions: {active_pos_count}\n"
-                f"Stop Mode: {config.BOT_STATE['stop_mode']}"
+                f"Stop Mode: {RuntimeCoordinator().get_state("stop_mode")}"
             )
             self.send(status_msg)
 
@@ -246,49 +294,16 @@ class TelegramManager:
             self.send(pos_details)
 
         elif cmd == "/stop":
-            config.BOT_STATE["is_running"] = False
-            config.BOT_STATE["stop_mode"] = "pause_only"
-            STOP_FLAG_PATH = "/tmp/trading_bot.stop"
-            try:
-                with open(STOP_FLAG_PATH, "w") as f:
-                    f.write("STOP")
-            except Exception:
-                pass
-            self.send("[STOP] BOT STOPPED\nTrading halted.", priority=0)
+            RuntimeCoordinator().enqueue_command("PAUSE")
+            self.send("[STOP] Pause command queued. Awaiting main loop confirmation.", priority=0)
 
         elif cmd == "/stop_all":
-            self.send("[WARN] EMERGENCY STOP INITIALIZED", priority=0)
-            
-            def _detached_emergency_stop():
-                try:
-                    if pos_manager:
-                        pos_manager.close_all_positions(execution_engine, dh)
-                    self.send("[STOP] BOT STOPPED\nAll positions closed.", priority=0)
-                except Exception as e:
-                    errors_logger.error(f"Telegram emergency close failed: {e}")
-                    self.send(f"[ERROR] Emergency close failed: {e}", priority=0)
-                    
-            config.BOT_STATE["is_running"] = False
-            config.BOT_STATE["stop_mode"] = "close_all_and_stop"
-            STOP_FLAG_PATH = "/tmp/trading_bot.stop"
-            try:
-                with open(STOP_FLAG_PATH, "w") as f:
-                    f.write("STOP")
-            except Exception:
-                pass
-            
-            # Offload heavy exchange exit calls to background daemon thread
-            threading.Thread(target=_detached_emergency_stop, daemon=True, name="TelegramEmergencyStop").start()
+            self.send("[WARN] EMERGENCY STOP QUEUED", priority=0)
+            RuntimeCoordinator().enqueue_command("STOP_ALL")
 
         elif cmd == "/start":
-            config.BOT_STATE["is_running"] = True
-            STOP_FLAG_PATH = "/tmp/trading_bot.stop"
-            if os.path.exists(STOP_FLAG_PATH):
-                try:
-                    os.remove(STOP_FLAG_PATH)
-                except Exception:
-                    pass
-            self.send("[START] BOT STARTED\nTrading resumed.", priority=0)
+            RuntimeCoordinator().enqueue_command("RESUME")
+            self.send("[START] Resume command queued.", priority=0)
 
 # Global Instance
 _manager = TelegramManager()

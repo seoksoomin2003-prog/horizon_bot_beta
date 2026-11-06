@@ -3,12 +3,31 @@ import os
 import time
 import threading
 from typing import Dict, Any
-from utils.persistence import atomic_write_json
+from utils.persistence import atomic_write_json, get_absolute_path
 import logging
 
+class JournalEvent:
+    TP1_TRIGGERED = "TP1_TRIGGERED"
+    TP1_EXECUTED = "TP1_EXECUTED"
+    TP1_PARTIALLY_FILLED = "TP1_PARTIALLY_FILLED"
+    TP2_TRIGGERED = "TP2_TRIGGERED"
+    TP2_EXECUTED = "TP2_EXECUTED"
+    TP2_PARTIALLY_FILLED = "TP2_PARTIALLY_FILLED"
+    DUST_QUARANTINED = "DUST_QUARANTINED"
+    POSITION_CLOSED = "POSITION_CLOSED"
+    EMERGENCY_CLOSE = "EMERGENCY_CLOSE"
+    DUST_CLEARED = "DUST_CLEARED"
+
+def normalize_event_name(event: str) -> str:
+    if event == "DUST_QUARANTINE":
+        return JournalEvent.DUST_QUARANTINED
+    if event == "POSITION_CLOSED_CONFIRMED":
+        return JournalEvent.POSITION_CLOSED
+    return event
+
 class ExecutionJournal:
-    LOG_PATH = "data/execution_journal.log"
-    SNAPSHOT_PATH = "data/lifecycle_state.json"
+    LOG_PATH = get_absolute_path("execution_journal.log")
+    SNAPSHOT_PATH = get_absolute_path("lifecycle_state.json")
     _lock = threading.RLock()
 
     @classmethod
@@ -18,9 +37,12 @@ class ExecutionJournal:
     @classmethod
     def log_event(cls, symbol: str, event: str, metadata: Dict[str, Any] = None):
         """Appends to the execution log and updates the snapshot. Fully serialized."""
+        from utils.validator import normalize_symbol
+        symbol = normalize_symbol(symbol)
         with cls._lock:
             cls._ensure_dirs()
             metadata = metadata or {}
+            event = normalize_event_name(event)
             entry = {
                 "timestamp": time.time(),
                 "symbol": symbol,
@@ -28,15 +50,21 @@ class ExecutionJournal:
                 "metadata": metadata
             }
             
+            # Tiered Durability
+            is_critical = event in (JournalEvent.TP1_EXECUTED, JournalEvent.TP2_EXECUTED, 
+                                    JournalEvent.POSITION_CLOSED, JournalEvent.EMERGENCY_CLOSE, 
+                                    JournalEvent.DUST_QUARANTINED)
+            
             # 1. Append-only log
             try:
                 with open(cls.LOG_PATH, 'a') as f:
                     f.write(json.dumps(entry) + "\n")
                     f.flush()
-                    try:
-                        os.fsync(f.fileno())
-                    except OSError:
-                        pass # Allow best-effort fsync if not supported on platform
+                    if is_critical:
+                        try:
+                            os.fsync(f.fileno())
+                        except OSError:
+                            pass # Allow best-effort fsync if not supported on platform
             except Exception as e:
                 logging.getLogger('errors_logger').critical(f"FATAL: Execution Journal append failed: {e}")
                 raise e
@@ -48,6 +76,7 @@ class ExecutionJournal:
     def _update_snapshot(cls, symbol: str, event: str):
         """Updates the snapshot cache based on the logged event."""
         with cls._lock:
+            event = normalize_event_name(event)
             snapshot = cls.get_all_snapshots()
             
             if symbol not in snapshot:
@@ -63,27 +92,39 @@ class ExecutionJournal:
             state = snapshot[symbol]
             state["last_event"] = event
             
-            if event == "TP1_TRIGGERED":
+            if event == JournalEvent.TP1_TRIGGERED:
                 state["tp1_pending"] = True
-            elif event == "TP1_EXECUTED":
+            elif event == JournalEvent.TP1_EXECUTED:
                 state["tp1_done"] = True
                 state["tp1_pending"] = False
-            elif event == "TP1_PARTIALLY_FILLED":
+            elif event == JournalEvent.TP1_PARTIALLY_FILLED:
                 state["tp1_pending"] = True
                 state["tp1_done"] = False
-            elif event == "TP2_TRIGGERED":
+            elif event == JournalEvent.TP2_TRIGGERED:
                 state["tp2_pending"] = True
-            elif event == "TP2_EXECUTED":
+            elif event == JournalEvent.TP2_EXECUTED:
                 state["tp2_done"] = True
                 state["tp2_pending"] = False
-            elif event == "TP2_PARTIALLY_FILLED":
+            elif event == JournalEvent.TP2_PARTIALLY_FILLED:
                 state["tp2_pending"] = True
                 state["tp2_done"] = False
-            elif event == "DUST_QUARANTINED":
+            elif event == JournalEvent.DUST_QUARANTINED:
                 state["dust_quarantined"] = True
-            elif event == "POSITION_CLOSED" or event == "EMERGENCY_CLOSE":
-                # Reset lifecycle on full close
-                snapshot.pop(symbol, None)
+            elif event == JournalEvent.DUST_CLEARED:
+                state["dust_quarantined"] = False
+            elif event in [JournalEvent.POSITION_CLOSED, JournalEvent.EMERGENCY_CLOSE]:
+                # Reset lifecycle on full close but PRESERVE dust quarantine state if active!
+                was_quarantined = state.get("dust_quarantined", False) if symbol in snapshot else False
+                snapshot[symbol] = {
+                    "tp1_done": False,
+                    "tp2_done": False,
+                    "tp1_pending": False,
+                    "tp2_pending": False,
+                    "dust_quarantined": was_quarantined,
+                    "last_event": event
+                }
+                if not was_quarantined:
+                    snapshot.pop(symbol, None)
 
             try:
                 atomic_write_json(cls.SNAPSHOT_PATH, snapshot)
@@ -107,9 +148,11 @@ class ExecutionJournal:
                         if not line.strip(): continue
                         try:
                             entry = json.loads(line)
-                            symbol = entry.get("symbol")
+                            from utils.validator import normalize_symbol
+                            symbol = normalize_symbol(entry.get("symbol"))
                             event = entry.get("event")
                             if not symbol or not event: continue
+                            event = normalize_event_name(event)
                             
                             if symbol not in snapshot:
                                 snapshot[symbol] = {
@@ -124,26 +167,38 @@ class ExecutionJournal:
                             state = snapshot[symbol]
                             state["last_event"] = event
                             
-                            if event == "TP1_TRIGGERED":
+                            if event == JournalEvent.TP1_TRIGGERED:
                                 state["tp1_pending"] = True
-                            elif event == "TP1_EXECUTED":
+                            elif event == JournalEvent.TP1_EXECUTED:
                                 state["tp1_done"] = True
                                 state["tp1_pending"] = False
-                            elif event == "TP1_PARTIALLY_FILLED":
+                            elif event == JournalEvent.TP1_PARTIALLY_FILLED:
                                 state["tp1_pending"] = True
                                 state["tp1_done"] = False
-                            elif event == "TP2_TRIGGERED":
+                            elif event == JournalEvent.TP2_TRIGGERED:
                                 state["tp2_pending"] = True
-                            elif event == "TP2_EXECUTED":
+                            elif event == JournalEvent.TP2_EXECUTED:
                                 state["tp2_done"] = True
                                 state["tp2_pending"] = False
-                            elif event == "TP2_PARTIALLY_FILLED":
+                            elif event == JournalEvent.TP2_PARTIALLY_FILLED:
                                 state["tp2_pending"] = True
                                 state["tp2_done"] = False
-                            elif event == "DUST_QUARANTINED":
+                            elif event == JournalEvent.DUST_QUARANTINED:
                                 state["dust_quarantined"] = True
-                            elif event == "POSITION_CLOSED" or event == "EMERGENCY_CLOSE":
-                                snapshot.pop(symbol, None)
+                            elif event == JournalEvent.DUST_CLEARED:
+                                state["dust_quarantined"] = False
+                            elif event in [JournalEvent.POSITION_CLOSED, JournalEvent.EMERGENCY_CLOSE]:
+                                was_quarantined = state.get("dust_quarantined", False)
+                                snapshot[symbol] = {
+                                    "tp1_done": False,
+                                    "tp2_done": False,
+                                    "tp1_pending": False,
+                                    "tp2_pending": False,
+                                    "dust_quarantined": was_quarantined,
+                                    "last_event": event
+                                }
+                                if not was_quarantined:
+                                    snapshot.pop(symbol, None)
                         except json.JSONDecodeError:
                             continue # Skip malformed log lines safely
                             
@@ -191,6 +246,8 @@ class ExecutionJournal:
     @classmethod
     def get_snapshot(cls, symbol: str) -> Dict[str, Any]:
         """Gets snapshot state for a single symbol with safe defaults."""
+        from utils.validator import normalize_symbol
+        symbol = normalize_symbol(symbol)
         with cls._lock:
             return cls.get_all_snapshots().get(symbol, {
                 "tp1_done": False,
@@ -236,4 +293,3 @@ class ExecutionJournal:
                     atomic_write_json(cls.SNAPSHOT_PATH, replayed)
                 except Exception as e:
                     logging.getLogger('errors_logger').critical(f"Failed to atomically write aligned snapshot: {e}")
-

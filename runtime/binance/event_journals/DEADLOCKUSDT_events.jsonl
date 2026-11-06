@@ -1,0 +1,12 @@
+{"sequence": 1, "stream_version": 1, "timestamp": 1780315997.192937, "event_type": "WORKER_STALLED", "metadata": {"worker_type": "EXIT"}}
+{"sequence": 2, "stream_version": 2, "timestamp": 1780316041.2472699, "event_type": "WORKER_STALLED", "metadata": {"worker_type": "EXIT"}}
+{"sequence": 3, "stream_version": 3, "timestamp": 1780316287.199585, "event_type": "WORKER_STALLED", "metadata": {"worker_type": "EXIT"}}
+{"sequence": 4, "stream_version": 4, "timestamp": 1780316391.011062, "event_type": "WORKER_STALLED", "metadata": {"worker_type": "EXIT"}}
+{"sequence": 5, "stream_version": 5, "timestamp": 1780317600.191287, "event_type": "WORKER_STALLED", "metadata": {"worker_type": "EXIT"}}
+{"sequence": 6, "stream_version": 6, "timestamp": 1780318083.477076, "event_type": "WORKER_STALLED", "metadata": {"worker_type": "EXIT"}}
+{"sequence": 7, "stream_version": 7, "timestamp": 1780402418.775425, "event_type": "WORKER_STALLED", "metadata": {"worker_type": "EXIT"}}
+{"sequence": 8, "stream_version": 8, "timestamp": 1780402992.063643, "event_type": "WORKER_STALLED", "metadata": {"worker_type": "EXIT"}}
+{"sequence": 9, "stream_version": 9, "timestamp": 1780403512.829653, "event_type": "WORKER_STALLED", "metadata": {"worker_type": "EXIT"}}
+{"sequence": 10, "stream_version": 10, "timestamp": 1780403653.1420748, "event_type": "WORKER_STALLED", "metadata": {"worker_type": "EXIT"}}
+{"sequence": 11, "stream_version": 11, "timestamp": 1780403909.7360268, "event_type": "WORKER_STALLED", "metadata": {"worker_type": "EXIT"}}
+{"sequence": 12, "stream_version": 12, "timestamp": 1780767277.957032, "event_type": "WORKER_STALLED", "metadata": {"worker_type": "EXIT"}}

@@ -9,7 +9,10 @@ from utils.schemas import PositionSchema
 
 
 class LifecycleState(str, Enum):
+    ENTRY_PENDING_PROTECTION = "ENTRY_PENDING_PROTECTION"
+    POSITION_ACTIVE = "OPEN"
     OPEN = "OPEN"
+    PARTIAL = "PARTIAL"
     TP1_PENDING = "TP1_PENDING"
     TP1_PARTIAL_PENDING = "TP1_PARTIAL_PENDING"
     TP1_PARTIALLY_FILLED = "TP1_PARTIALLY_FILLED"
@@ -37,6 +40,15 @@ def derive_lifecycle_state(pos: PositionSchema) -> str:
         return LifecycleState.CLOSED.value
     if (pos.amount or 0.0) <= 0 or str(getattr(pos, "status", "")).lower() == "closed":
         return LifecycleState.CLOSED.value
+
+    # ENTRY_PENDING_PROTECTION / PARTIAL checks
+    current_state = getattr(pos, "lifecycle_state", "")
+    if current_state == "PARTIAL":
+        return LifecycleState.PARTIAL.value
+
+    stop_loss = getattr(pos, "stop_loss", 0.0) or 0.0
+    if stop_loss <= 0.0:
+        return LifecycleState.ENTRY_PENDING_PROTECTION.value
 
     # Get quantity details
     intended = getattr(pos, "intended_qty", 0.0) or 0.0
@@ -82,7 +94,7 @@ def derive_lifecycle_state(pos: PositionSchema) -> str:
     if bool(getattr(pos, "tp1_done", False)):
         return LifecycleState.TP1_DONE.value
 
-    return LifecycleState.OPEN.value
+    return LifecycleState.POSITION_ACTIVE.value
 
 
 def validate_position_lifecycle(

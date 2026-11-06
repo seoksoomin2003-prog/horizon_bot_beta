@@ -60,7 +60,7 @@ class ExitEngine:
             return ExitAction.FULL_CLOSE, amount, "VOL_SPIKE_PROTECTION", None
 
         # 3. VOLATILITY COLLAPSE
-        if current_atr < (atr_entry * self.VOL_COLLAPSE_MULT):
+        if current_atr > 0 and atr_entry > 0 and current_atr < (atr_entry * self.VOL_COLLAPSE_MULT):
             return ExitAction.FULL_CLOSE, amount, "VOL_COLLAPSE_EXIT", None
 
         # 4. TREND FLIP

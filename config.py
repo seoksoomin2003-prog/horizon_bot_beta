@@ -42,12 +42,7 @@ class Config:
     TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
     DEMO_MODE = safe_config("DEMO_MODE", "false").lower() == "true"
 
-    # Global Bot State
-    BOT_STATE = {
-        "is_running": True,
-        "trading_enabled": True,   # NEW: Set to False if Position Mode is unknown (Read-Only)
-        "stop_mode": "pause_only" # 'pause_only' or 'close_all_and_stop'
-    }
+    # Global Bot State has been moved to utils.runtime_coordinator.RuntimeCoordinator
 
     # 2. Institutional Risk Parameters (PHASE 1 CORE)
     STOP_LOSS_ATR_MULT = 1.5
@@ -126,7 +121,7 @@ BITGET_PASSPHRASE = Config.BITGET_PASSPHRASE
 TELEGRAM_BOT_TOKEN = Config.TELEGRAM_BOT_TOKEN
 TELEGRAM_CHAT_ID = Config.TELEGRAM_CHAT_ID
 TELEGRAM_ENABLED = Config.TELEGRAM_ENABLED
-BOT_STATE = Config.BOT_STATE
+# BOT_STATE is removed
 SYMBOLS = Config.SYMBOLS
 SYMBOL_OVERRIDES = Config.SYMBOL_OVERRIDES
 TIMEFRAME = Config.TIMEFRAME

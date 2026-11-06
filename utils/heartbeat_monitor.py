@@ -3,7 +3,8 @@ import threading
 import logging
 from datetime import datetime
 import config
-from config import BOT_STATE
+from utils.runtime_coordinator import RuntimeCoordinator
+
 from logger import trades_logger, errors_logger
 from utils.telegram_commands import send_message
 
@@ -23,7 +24,7 @@ def _monitor_loop(data_handler, position_manager, risk_engine):
             
             # 1. Collect Data
             exchange = config.EXCHANGE.upper()
-            is_running = BOT_STATE.get("is_running", False)
+            is_running = RuntimeCoordinator().get_state("is_running", False)
             status_text = "RUNNING" if is_running else "STOPPED (PAUSED)"
             
             # Fetch real-time equity
@@ -37,7 +38,7 @@ def _monitor_loop(data_handler, position_manager, risk_engine):
             
             # Win Rate
             history = risk_engine.performance_history[-50:]
-            wins = [t for t in history if t['pnl'] > 0]
+            wins = [t for t in history if t.pnl > 0]
             win_rate = (len(wins) / len(history)) if history else 0.0
             
             # Count active positions

@@ -3,10 +3,10 @@ import os
 import shutil
 from logger import errors_logger
 
-# Use ABSOLUTE paths for Windows reliability
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-POSITIONS_FILE = os.path.join(BASE_DIR, 'data', 'positions.json')
-BACKUP_FILE = os.path.join(BASE_DIR, 'data', 'positions_backup.json')
+from utils.persistence import get_absolute_path
+
+POSITIONS_FILE = get_absolute_path('positions.json')
+BACKUP_FILE = get_absolute_path('positions_backup.json')
 
 def save_positions(positions):
     """
@@ -24,7 +24,11 @@ def save_positions(positions):
         shutil.copy2(POSITIONS_FILE, BACKUP_FILE)
         
     except Exception as e:
-        errors_logger.error(f"Failed to save positions: {e}")
+        errors_logger.critical(f"FATAL: Failed to save positions: {e}. HALTING BOT.")
+        import config
+        from utils.runtime_coordinator import RuntimeCoordinator
+        RuntimeCoordinator().set_state("is_running", False)
+        raise e
 
 def load_positions():
     """
