@@ -257,12 +257,16 @@ class TestReconstructionIntegrity(unittest.TestCase):
         res = eng.atomic_stop_update("BTCUSDT", pos, 95.0)
         elapsed = time.time() - start
         
-        # Verify that because placement succeeded first, migration returns True
-        # even though old SL cancellation failed / stalled best-effort
-        self.assertTrue(res)
+        # The new stop is live, but the old one could not be cancelled: double-stop risk must be reported,
+        # not hidden. Protection stays on the new stop and new entries are frozen.
+        self.assertFalse(res)
         self.assertEqual(pos.stop_loss, 95.0)
         self.assertEqual(pos.sl_plan_id, "new_sl_id")
-        print(f"[PASS] Stop-First migration succeeded in {elapsed:.3f}s, preserving protection even during Bitget cancel stall.")
+        self.assertEqual(pos.lifecycle_state, "PROTECTION_CONFLICT")
+        from utils.degraded_manager import DegradedExchangeManager, ExchangeDegradationState
+        self.assertEqual(DegradedExchangeManager().get_state(), ExchangeDegradationState.CRITICAL_PROTECTION_FAILURE)
+        DegradedExchangeManager().set_state(ExchangeDegradationState.HEALTHY, "test cleanup")
+        print(f"[PASS] Stop-First migration flagged the conflict in {elapsed:.3f}s, preserving protection even during Bitget cancel stall.")
 
     def test_07_executor_worker_hang(self):
         print("\n--- [TEST-7] Executor worker hang ---")

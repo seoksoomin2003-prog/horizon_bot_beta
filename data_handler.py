@@ -61,6 +61,10 @@ class DataHandler:
     def exchange(self):
         """Thread-local exchange accessor. Creates instance per thread dynamically."""
         if not hasattr(self._local, 'instance'):
+            if config.IS_PAPER:
+                from paper.exchange import PaperExchange, get_broker
+                self._local.instance = PaperExchange(self.exchange_name, get_broker())
+                return self._local.instance
             if self.exchange_name == "binance":
                 inst = ccxt.binance(self._exchange_config)
             elif self.exchange_name == "bitget":

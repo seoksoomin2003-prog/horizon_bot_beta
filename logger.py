@@ -19,7 +19,8 @@ def setup_logger():
     """
     # Use ABSOLUTE paths to prevent Windows drive/current-dir ambiguity
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    log_dir = os.path.join(BASE_DIR, 'logs')
+    import config
+    log_dir = os.environ.get("HORIZON_LOG_DIR") or os.path.join(BASE_DIR, 'logs', 'paper' if config.IS_PAPER else '')
     
     if not os.path.exists(log_dir):
         os.makedirs(log_dir, exist_ok=True)

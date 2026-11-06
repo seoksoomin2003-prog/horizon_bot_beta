@@ -11,6 +11,7 @@ INVARIANTS:
 
 import uuid
 import time
+import config
 from logger import trades_logger, errors_logger
 from utils.safe_core import SafeCore
 from utils.telegram_commands import send_message
@@ -228,7 +229,7 @@ class ExecutionEngine:
             )
 
         # Real Execution logic (mapping to legacy execute_trade)
-        trades_logger.info(f"[LIVE] Routing Firm Order to Exchange: {request.symbol} {request.side} {request.amount}")
+        trades_logger.info(f"[{'PAPER' if config.IS_PAPER else 'LIVE'}] Routing Firm Order to Exchange: {request.symbol} {request.side} {request.amount}")
         
         # Create a transient signal for legacy compatibility
         signal = TradeSignal(symbol=request.symbol, trigger=request.side, confidence=request.conviction_at_entry)

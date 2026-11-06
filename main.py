@@ -22,7 +22,22 @@ from pipeline import Pipeline
 from utils.exit_engine import ExitEngine
 from utils.invariants_v2 import InvariantsV2
 
+def check_trading_mode():
+    """Refuses unsafe live starts before any connection or state is opened."""
+    if config.IS_PAPER:
+        trades_logger.warning("PAPER MODE: public prices only, simulated orders, no API keys loaded.")
+        return
+    if not config.LIVE_CONFIRMED:
+        trades_logger.critical(f"TRADING_MODE=live needs LIVE_TRADING_CONFIRM={config.LIVE_CONFIRM_PHRASE}. Refusing to start.")
+        sys.exit(1)
+    if config.DEMO_MODE and config.EXCHANGE == "binance":
+        trades_logger.critical("DEMO_MODE has no effect on Binance and would trade for real. Remove it or use paper mode. Refusing to start.")
+        sys.exit(1)
+    trades_logger.critical("LIVE MODE: real orders with real money.")
+
+
 def run_v3():
+    check_trading_mode()
     trades_logger.info("Initializing Horizon Bot v3 [FULL RECONSTRUCTION]...")
     
     from utils.persistence import get_absolute_path
@@ -40,7 +55,7 @@ def run_v3():
         sys.exit(1)
 
     # Credential Check for Live Mode
-    if not config.DEMO_MODE:
+    if config.IS_LIVE and not config.DEMO_MODE:
         active_key = config.BINANCE_API_KEY if config.EXCHANGE == "binance" else config.BITGET_API_KEY
         if not active_key or "your_" in active_key:
             trades_logger.critical(f"!!! LIVE MODE DETECTED WITH MISSING/PLACEHOLDER KEYS [{config.EXCHANGE.upper()}] !!!")
@@ -54,7 +69,7 @@ def run_v3():
         signal = SignalEngine()
         conviction = ConvictionEngine()
         risk = RiskEngine()
-        # Initializing execution with LIVE mode
+        # simulation_mode=False runs the full order path. In paper mode that path ends at PaperExchange.
         execution = ExecutionEngine(dh, simulation_mode=False)
         exit_e = ExitEngine()
         
@@ -85,8 +100,9 @@ def run_v3():
         # Initialize connection (blocking/bounded setup calls)
         dh.initialize_exchange_connection()
 
-        send_message("✅ <b>Exchange Connection Initialized</b>\nLive Execution Pipeline Active.")
-        trades_logger.info("V3 System Active. Main Loop Started [LIVE MODE].")
+        mode_label = "PAPER" if config.IS_PAPER else "LIVE"
+        send_message(f"✅ <b>Exchange Connection Initialized</b>\n{mode_label} Execution Pipeline Active.")
+        trades_logger.info(f"V3 System Active. Main Loop Started [{mode_label} MODE].")
 
         # D. Continuous Execution Pipeline
         while True:

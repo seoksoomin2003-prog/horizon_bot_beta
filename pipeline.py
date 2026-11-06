@@ -22,6 +22,10 @@ from utils.lifecycle import validate_position_lifecycle
 import config
 from utils.runtime_coordinator import RuntimeCoordinator
 
+# Well above the normal 15 s cycle (config.RECONCILE_INTERVAL), so only a real sleep or stall reads as a wake-up.
+WAKE_GAP_SECONDS = 60.0
+
+
 class WorkerLease:
     def __init__(self, symbol: str, worker_type: str):
         import uuid
@@ -85,7 +89,8 @@ class Pipeline:
         try:
             # Sleep-Wake Watchdog Detection
             now_mono = time.monotonic()
-            if now_mono - self.last_tick_time > 15.0:
+            # Must exceed the normal cycle (RECONCILE_INTERVAL), or every ordinary tick reads as a wake-up.
+            if now_mono - self.last_tick_time > WAKE_GAP_SECONDS:
                 errors_logger.critical(
                     f"[SYSTEM_WAKE] System sleep or major tick timing gap detected (elapsed: {now_mono - self.last_tick_time:.1f}s). "
                     f"Invalidating all active leases and clearing thread registries to prevent avalanches."
@@ -601,6 +606,12 @@ class Pipeline:
                 if new_pos:
                     new_pos.candles_held = 0
                     new_pos.atr = float(atr or 0.0)
+                    # Positions are re-projected from events, so the entry ATR must be an event too.
+                    try:
+                        from utils.event_sourced_runtime import OwnershipRegistry
+                        OwnershipRegistry().get_owner(symbol).submit_event("RECONCILE_CORRECTION", {"atr": new_pos.atr})
+                    except Exception as atr_err:
+                        errors_logger.error(f"[ATR_EVENT_FAILED] {symbol}: {atr_err}")
                     self.risk.record_execution_event(symbol)
                     # E. STATE SYNC (Immediate)
                     with self.state.lock:

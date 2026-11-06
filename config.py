@@ -21,26 +21,49 @@ def set_runtime_telegram_enabled(enabled: bool):
     Config.TELEGRAM_ENABLED = normalized
     globals()["TELEGRAM_ENABLED"] = normalized
 
+# --- TRADING MODE: paper unless TRADING_MODE=live is set explicitly ---
+LIVE_CONFIRM_PHRASE = "I_ACCEPT_REAL_LOSSES"
+IS_LIVE = os.getenv("TRADING_MODE", "paper").strip().lower() == "live"
+IS_PAPER = not IS_LIVE
+LIVE_CONFIRMED = os.getenv("LIVE_TRADING_CONFIRM", "").strip() == LIVE_CONFIRM_PHRASE
+
+
+def _secret(*names: str) -> str:
+    """Returns the first set value. Paper mode never loads a secret into memory."""
+    if IS_PAPER:
+        return ""
+    for name in names:
+        value = os.getenv(name, "")
+        if value:
+            return value
+    return ""
+
+
 # --- PHASE 7: CONFIG CLASS STRUCTURE ---
 class Config:
     # 1. Exchange & Auth
     EXCHANGE = safe_config("EXCHANGE", "binance").lower()
     
     # Binance Credentials (Dual Support)
-    BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", os.getenv("API_KEY", ""))
-    BINANCE_SECRET = os.getenv("BINANCE_SECRET", os.getenv("BINANCE_API_SECRET", os.getenv("SECRET_KEY", "")))
+    BINANCE_API_KEY = _secret("BINANCE_API_KEY", "API_KEY")
+    BINANCE_SECRET = _secret("BINANCE_SECRET", "BINANCE_API_SECRET", "SECRET_KEY")
     BINANCE_API_SECRET = BINANCE_SECRET
 
     # Bitget Credentials
-    BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
-    BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
-    BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
+    BITGET_API_KEY = _secret("BITGET_API_KEY")
+    BITGET_API_SECRET = _secret("BITGET_API_SECRET")
+    BITGET_PASSPHRASE = _secret("BITGET_PASSPHRASE")
 
     # Telegram Alerting
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("BINANCE_TELEGRAM_TOKEN", ""))
-    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", os.getenv("BINANCE_TELEGRAM_CHAT_ID", ""))
+    TELEGRAM_BOT_TOKEN = _secret("TELEGRAM_BOT_TOKEN", "BINANCE_TELEGRAM_TOKEN")
+    TELEGRAM_CHAT_ID = _secret("TELEGRAM_CHAT_ID", "BINANCE_TELEGRAM_CHAT_ID")
     TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
     DEMO_MODE = safe_config("DEMO_MODE", "false").lower() == "true"
+
+    # Paper account assumptions (not measured values)
+    PAPER_INITIAL_EQUITY = float(os.getenv("PAPER_INITIAL_EQUITY", "1000"))
+    PAPER_FEE = float(os.getenv("PAPER_FEE", "0.0005"))
+    PAPER_SLIPPAGE_BPS = float(os.getenv("PAPER_SLIPPAGE_BPS", "5"))
 
     # Global Bot State has been moved to utils.runtime_coordinator.RuntimeCoordinator
 
@@ -161,4 +184,7 @@ EQUITY_ROLLING_WINDOW_DAYS = Config.EQUITY_ROLLING_WINDOW_DAYS
 STOP_LOSS_ATR_MULT = Config.STOP_LOSS_ATR_MULT
 TARGET_RR = Config.TARGET_RR
 DEMO_MODE = Config.DEMO_MODE
+PAPER_INITIAL_EQUITY = Config.PAPER_INITIAL_EQUITY
+PAPER_FEE = Config.PAPER_FEE
+PAPER_SLIPPAGE_BPS = Config.PAPER_SLIPPAGE_BPS
 SUPPORTED_TIMEFRAMES = Config.SUPPORTED_TIMEFRAMES

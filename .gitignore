@@ -9,3 +9,8 @@ __pycache__/
 
 logs/*.log
 data/*.log
+
+logs/paper/
+runtime/paper_*/
+.venv/
+.run/

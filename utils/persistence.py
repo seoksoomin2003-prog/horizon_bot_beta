@@ -17,7 +17,10 @@ def get_absolute_path(*path_segments: str) -> str:
     # Isolate all runtime state and persistence files by exchange deployment
     import config
     exchange_name = getattr(config, "EXCHANGE", "binance").lower()
-    base_data_dir = os.path.join(base_dir, 'runtime', exchange_name)
+    # Paper state never shares a folder with live state. Tests redirect the whole tree.
+    if getattr(config, "IS_PAPER", True):
+        exchange_name = f"paper_{exchange_name}"
+    base_data_dir = os.path.join(os.environ.get("HORIZON_RUNTIME_DIR") or os.path.join(base_dir, 'runtime'), exchange_name)
     
     cleaned_segments = []
     for seg in path_segments:

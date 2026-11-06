@@ -56,7 +56,8 @@ class ExitEngine:
 
         # 2. VOLATILITY SPIKE EXIT
         candle_range = abs(current_price - entry)
-        if current_atr > 0 and candle_range > (atr_entry * self.VOL_SPIKE_MULT):
+        # atr_entry 0 means the entry ATR is unknown, not that every move is a spike.
+        if current_atr > 0 and atr_entry > 0 and candle_range > (atr_entry * self.VOL_SPIKE_MULT):
             return ExitAction.FULL_CLOSE, amount, "VOL_SPIKE_PROTECTION", None
 
         # 3. VOLATILITY COLLAPSE
