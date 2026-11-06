@@ -5,7 +5,7 @@
 ## 설치 (처음 한 번)
 
 ```bash
-cd ~/Desktop/horizon_bot_beta && ./run_mac.sh setup
+cd ~/Projects/horizon_bot_beta && ./run_mac.sh setup
 ```
 
 ## 가상 매매

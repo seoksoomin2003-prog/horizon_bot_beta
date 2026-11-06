@@ -5,6 +5,7 @@ SINGLE CONTINUOUS EXECUTION PIPELINE:
 SIGNAL -> CONVICTION -> RISK -> EXECUTION -> EXIT -> STATE_SYNC
 """
 
+import pandas as pd
 import time
 import threading
 from typing import List, Dict, Any, Optional
@@ -24,6 +25,25 @@ from utils.runtime_coordinator import RuntimeCoordinator
 
 # Well above the normal 15 s cycle (config.RECONCILE_INTERVAL), so only a real sleep or stall reads as a wake-up.
 WAKE_GAP_SECONDS = 60.0
+# An entry worker in this state has passed its last check and is sending an order, so it must not be flagged as hung
+# or replaced, or the same symbol could be ordered twice. The limit only guards against a thread that never returns.
+LEASE_ORDERING = "ORDERING"
+ORDER_IN_FLIGHT_LIMIT_SECONDS = 120.0
+
+
+def trend_was_with_position_since_entry(df, side: str, opened_at: float) -> bool:
+    """True if the trend bias matched the position on the entry bar or later, so an opposing bias now is a real flip.
+
+    Unknown or out-of-window entry times return True, which keeps the plain trend-exit behaviour for those positions.
+    """
+    if not opened_at or opened_at <= 0 or df is None or df.empty:
+        return True
+    bar_open = (df["timestamp"] - pd.Timestamp(0)).dt.total_seconds()
+    started = bar_open <= opened_at
+    if not started.any() or bool(started.iloc[0]) is False:
+        return True
+    entry_bar = started[started].index[-1]
+    return bool((df.loc[entry_bar:, "trend_bias"] == side).any())
 
 
 class WorkerLease:
@@ -120,7 +140,10 @@ class Pipeline:
             # Enforce Dead System Health Circuit Breakers
             system_ok, health_reason = self.risk.check_system_health(account_state.equity, is_available=is_available)
             if not system_ok:
-                errors_logger.critical(f"[SYSTEM HEALTH BREACH] {health_reason} — Freezing all entry activities.")
+                if health_reason.startswith("ENTRY RATE LIMIT"):
+                    trades_logger.warning(f"[ENTRY PAUSED] {health_reason}")
+                else:
+                    errors_logger.critical(f"[SYSTEM HEALTH BREACH] {health_reason} — Freezing all entry activities.")
 
             import concurrent.futures
 
@@ -215,6 +238,9 @@ class Pipeline:
                                 now = time.time()
                                 if lease is not None:
                                     elapsed = now - lease.start_time
+                                    if lease.status == LEASE_ORDERING and elapsed <= ORDER_IN_FLIGHT_LIMIT_SECONDS:
+                                        trades_logger.warning(f"[ORDER_IN_FLIGHT] Entry order for {sym} still running (elapsed: {elapsed:.1f}s). Skipping duplicate submission.")
+                                        continue
                                     if elapsed > 10.0 or lease.status == "STALLED":
                                         errors_logger.warning(
                                             f"[LEASE_EXPIRED] Entry worker lease expired/stalled for {sym} (elapsed: {elapsed:.1f}s). "
@@ -256,17 +282,22 @@ class Pipeline:
                                     self.risk.record_system_failure()
                                 continue
                                 
+                            # 5. Transition worker into WORKER_STALLED state, unless its order is already being sent.
+                            # Same lock as _claim_entry_order, so a worker is either stopped here or ordering, never both.
+                            with self._worker_lock:
+                                lease = self.active_entry_workers.get(symbol)
+                                order_in_flight = bool(lease and lease.status == LEASE_ORDERING)
+                                if lease and not order_in_flight:
+                                    lease.status = "STALLED"
+                            if order_in_flight:
+                                trades_logger.warning(f"[ORDER_IN_FLIGHT] Entry order for {symbol} took over 5.0s and is still running.")
+                                continue
+
                             fut.cancel() # Unfinished task cancellation
                             cycle_failed = True
                             self.risk.record_system_failure()
                             errors_logger.critical(f"[TIMEOUT] Entry worker for {symbol} hung / exceeded timeout limit of 5.0s!")
-                            
-                            # 5. Transition worker into WORKER_STALLED state
-                            with self._worker_lock:
-                                lease = self.active_entry_workers.get(symbol)
-                                if lease:
-                                    lease.status = "STALLED"
-                            
+
                             # 6. Block duplicate, emit event, trigger degraded diagnostics
                             try:
                                 from utils.event_sourced_runtime import OwnershipRegistry
@@ -353,7 +384,8 @@ class Pipeline:
                 current_atr=SafeCore.float(last.get('atr')),
                 trend_bias=last.get('trend_bias', 'NEUTRAL'),
                 regime=last.get('regime', 'RANGE'),
-                min_qty=min_qty
+                min_qty=min_qty,
+                trend_flipped=trend_was_with_position_since_entry(df, pos.side, getattr(pos, "timestamp", 0.0))
             )
 
             if action == ExitAction.HOLD:
@@ -496,6 +528,14 @@ class Pipeline:
                 if current_lease and current_lease.thread_id == threading.get_ident():
                     self.active_exit_workers.pop(pos.symbol, None)
 
+    def _claim_entry_order(self, symbol: str, lease: WorkerLease) -> bool:
+        """Last check before an order: False if this worker was flagged as hung or replaced."""
+        with self._worker_lock:
+            if lease.status == "STALLED" or self.active_entry_workers.get(symbol) is not lease:
+                return False
+            lease.status = LEASE_ORDERING
+            return True
+
     def _process_single_entry(self, symbol: str, account, lease: WorkerLease):
         """
         Executes SIGNAL -> CONVICTION -> RISK -> EXECUTION flow for a single symbol concurrently.
@@ -598,7 +638,17 @@ class Pipeline:
                 if order_request.amount < 0.001:
                     trades_logger.info(f"[SKIPPED: TOO SMALL] {symbol} {conviction.side} Size: {order_request.amount}")
                     return
-                
+
+                if not self.risk.reserve_entry_slot():
+                    self.risk_rejection_count += 1
+                    trades_logger.info(f"[REJECTED: RATE_LIMIT] {symbol}: entry limit per minute reached")
+                    return
+
+                if not self._claim_entry_order(symbol, lease):
+                    self.risk.release_entry_slot()
+                    trades_logger.warning(f"[ENTRY ABORTED: STALE WORKER] {symbol}: worker timed out before ordering, no order sent")
+                    return
+
                 self.execution_attempt_count += 1
                 trades_logger.info(f"[ENTRY APPROVED] {symbol} {conviction.side} (Size: {order_request.amount}, Risk Scaling: {conviction.composite_score * micro_score:.2f})")
                 new_pos = self.execution.execute_firm_order(order_request)
@@ -609,10 +659,10 @@ class Pipeline:
                     # Positions are re-projected from events, so the entry ATR must be an event too.
                     try:
                         from utils.event_sourced_runtime import OwnershipRegistry
-                        OwnershipRegistry().get_owner(symbol).submit_event("RECONCILE_CORRECTION", {"atr": new_pos.atr})
+                        OwnershipRegistry().get_owner(symbol).submit_event("RECONCILE_CORRECTION", {"atr": new_pos.atr, "timestamp": time.time()})
                     except Exception as atr_err:
                         errors_logger.error(f"[ATR_EVENT_FAILED] {symbol}: {atr_err}")
-                    self.risk.record_execution_event(symbol)
+                    self.risk.record_execution_event(symbol, slot_reserved=True)
                     # E. STATE SYNC (Immediate)
                     with self.state.lock:
                         try:

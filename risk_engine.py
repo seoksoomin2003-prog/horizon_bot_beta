@@ -465,7 +465,7 @@ class RiskEngine:
             
             self.trade_timestamps = [t for t in self.trade_timestamps if now - t < 60]
             if len(self.trade_timestamps) >= MAX_TRADES_PER_MINUTE:
-                return False, f"LOSS LOOP DETECTED: {len(self.trade_timestamps)} trades in last 60s"
+                return False, f"ENTRY RATE LIMIT: {len(self.trade_timestamps)} entries in last 60s"
                 
             # 2. Never accept 0.0 as synthetic failure equity
             if is_available and current_equity > 0.0:
@@ -516,9 +516,27 @@ class RiskEngine:
             
             return True, ""
 
-    def record_execution_event(self, symbol: str):
+    def reserve_entry_slot(self) -> bool:
+        """Atomically takes one slot of the per-minute entry limit, so parallel workers cannot exceed it."""
+        from config import MAX_TRADES_PER_MINUTE
         with self.lock:
-            self.trade_timestamps.append(time.time())
+            now = time.time()
+            self.trade_timestamps = [t for t in self.trade_timestamps if now - t < 60]
+            if len(self.trade_timestamps) >= MAX_TRADES_PER_MINUTE:
+                return False
+            self.trade_timestamps.append(now)
+            return True
+
+    def release_entry_slot(self):
+        """Returns a slot only when no order was sent. A sent order keeps its slot even if it failed."""
+        with self.lock:
+            if self.trade_timestamps:
+                self.trade_timestamps.pop()
+
+    def record_execution_event(self, symbol: str, slot_reserved: bool = False):
+        with self.lock:
+            if not slot_reserved:
+                self.trade_timestamps.append(time.time())
             self.hourly_trades.setdefault(symbol, []).append(time.time())
 
     def record_system_failure(self):

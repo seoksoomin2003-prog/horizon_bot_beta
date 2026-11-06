@@ -360,9 +360,25 @@ class PaperExchange:
         return {"dualSidePosition": False}
 
 
+_shared_markets: Optional[tuple] = None
+_markets_lock = threading.Lock()
+
+
 def _public_client(exchange_name: str) -> Any:
+    """One market download per process. A failure leaves the client to load lazily, and the next client retries."""
+    global _shared_markets
     options = {"defaultType": "future"} if exchange_name == "binance" else {"defaultType": "swap"}
-    return getattr(ccxt, exchange_name)({"enableRateLimit": True, "timeout": 10_000, "options": options})
+    client = getattr(ccxt, exchange_name)({"enableRateLimit": True, "timeout": 10_000, "options": options})
+    with _markets_lock:
+        if _shared_markets is None:
+            try:
+                client.load_markets()
+                _shared_markets = (client.markets, client.currencies)
+            except Exception:
+                return client
+            return client
+        client.set_markets(*_shared_markets)
+    return client
 
 
 _broker: Optional[PaperBroker] = None

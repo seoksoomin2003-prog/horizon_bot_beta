@@ -353,3 +353,193 @@ def test_firm_order_route_runs_end_to_end_in_paper_mode(tmp_path):
     pos = eng.execute_firm_order(FirmOrderRequest(**{k: v for k, v in wanted.items() if k in known}))
     assert pos is not None and b.state["positions"]
     OwnershipRegistry().get_owner(symbol).submit_event("POSITION_CLOSED", {})
+
+
+def _entry_pipeline(approved=True):
+    """Runs the real entry worker with stubbed engines, down to the order call."""
+    from unittest.mock import MagicMock
+    import threading
+    import pandas as pd
+    from pipeline import Pipeline, WorkerLease
+    from risk_engine import RiskEngine
+    p = Pipeline.__new__(Pipeline)
+    p._worker_lock = threading.RLock()
+    p.active_entry_workers = {}
+    p.signal_generated_count = p.execution_attempt_count = p.risk_rejection_count = 0
+    p.dh, p.signal, p.conviction, p.state, p.execution = (MagicMock() for _ in range(5))
+    p.state.lock = threading.RLock()
+    p.state.last_entry_bar_ts = {}
+    p.state.is_position_active.return_value = False
+    p.dh.fetch_active_positions.return_value = []
+    p.dh.fetch_ticker.return_value = MagicMock(last=100.0)
+    p.dh.fetch_orderbook.return_value = {"bids": [[99.9, 10.0]], "asks": [[100.1, 10.0]]}
+    p.signal.compute_all_signals.return_value = pd.DataFrame([{"timestamp": 1, "atr": 1.0}])
+    p.signal.get_last_signal.return_value = MagicMock(trigger="LONG")
+    p.conviction.evaluate_signal.return_value = MagicMock(side="LONG", composite_score=1.0)
+    p.execution.execute_firm_order.return_value = None
+    p.risk = RiskEngine.__new__(RiskEngine)
+    p.risk.lock = threading.RLock()
+    p.risk.trade_timestamps = []
+    p.risk.hourly_trades = {}
+    p.risk.approve_order = MagicMock(return_value=MagicMock(approved=approved, amount=1.0))
+    def lease_for(symbol):
+        lease = WorkerLease(symbol, "ENTRY")
+        p.active_entry_workers[symbol] = lease
+        return lease
+    return p, lease_for
+
+
+@pytest.fixture
+def allow_entries(monkeypatch):
+    from utils.degraded_manager import DegradedExchangeManager
+    from utils.runtime_coordinator import RuntimeCoordinator
+    monkeypatch.setattr(DegradedExchangeManager, "is_entry_allowed", lambda self: True)
+    monkeypatch.setattr(RuntimeCoordinator, "get_state", lambda self, key, default=None: True)
+
+
+def test_worker_flagged_as_hung_sends_no_order(allow_entries):
+    p, lease_for = _entry_pipeline()
+    lease = lease_for("AAAUSDT")
+    lease.status = "STALLED"
+    p._process_single_entry("AAAUSDT", MagicMockAccount(), lease)
+    p.execution.execute_firm_order.assert_not_called()
+    assert p.risk.trade_timestamps == []  # the unused slot is returned
+
+
+def test_replaced_worker_sends_no_order(allow_entries):
+    p, lease_for = _entry_pipeline()
+    old = lease_for("AAAUSDT")
+    lease_for("AAAUSDT")
+    p._process_single_entry("AAAUSDT", MagicMockAccount(), old)
+    p.execution.execute_firm_order.assert_not_called()
+
+
+def test_healthy_worker_still_orders(allow_entries):
+    p, lease_for = _entry_pipeline()
+    p._process_single_entry("AAAUSDT", MagicMockAccount(), lease_for("AAAUSDT"))
+    p.execution.execute_firm_order.assert_called_once()
+
+
+def test_claim_marks_lease_as_ordering(allow_entries):
+    from pipeline import LEASE_ORDERING
+    p, lease_for = _entry_pipeline()
+    lease = lease_for("AAAUSDT")
+    assert p._claim_entry_order("AAAUSDT", lease)
+    assert lease.status == LEASE_ORDERING
+
+
+def test_parallel_entries_cannot_exceed_the_minute_limit(allow_entries):
+    p, lease_for = _entry_pipeline()
+    for sym in ("AAAUSDT", "BBBUSDT", "CCCUSDT"):
+        p._process_single_entry(sym, MagicMockAccount(), lease_for(sym))
+    assert p.execution.execute_firm_order.call_count == config.MAX_TRADES_PER_MINUTE
+    assert len(p.risk.trade_timestamps) == config.MAX_TRADES_PER_MINUTE
+
+
+def test_rate_limit_is_named_for_what_it_counts():
+    import threading
+    from risk_engine import RiskEngine
+    r = RiskEngine.__new__(RiskEngine)
+    r.lock = threading.RLock()
+    r.trade_timestamps = [time.time()] * config.MAX_TRADES_PER_MINUTE
+    ok, reason = r.check_system_health(1000.0)
+    assert not ok and reason.startswith("ENTRY RATE LIMIT")
+
+
+def test_markets_are_downloaded_once_across_threads(monkeypatch):
+    import paper.exchange as px
+
+    class Client:
+        loads = 0
+        def __init__(self, params):
+            self.markets, self.currencies = None, None
+        def load_markets(self):
+            Client.loads += 1
+            self.markets, self.currencies = {"A/USDT": {}}, {"USDT": {}}
+        def set_markets(self, markets, currencies=None):
+            self.markets, self.currencies = markets, currencies
+
+    monkeypatch.setattr(px, "_shared_markets", None)
+    monkeypatch.setattr(px.ccxt, "binance", Client)
+    clients = [px._public_client("binance") for _ in range(4)]
+    assert Client.loads == 1
+    assert all(c.markets == {"A/USDT": {}} for c in clients)
+
+
+def test_failed_market_download_is_retried_by_the_next_client(monkeypatch):
+    import paper.exchange as px
+
+    class Client:
+        fail = True
+        def __init__(self, params):
+            self.markets, self.currencies = None, None
+        def load_markets(self):
+            if Client.fail:
+                raise ccxt.NetworkError("down")
+            self.markets, self.currencies = {"A/USDT": {}}, {}
+
+    monkeypatch.setattr(px, "_shared_markets", None)
+    monkeypatch.setattr(px.ccxt, "binance", Client)
+    assert px._public_client("binance").markets is None
+    Client.fail = False
+    assert px._public_client("binance").markets == {"A/USDT": {}}
+
+
+class MagicMockAccount:
+    equity = 1000.0
+    used_margin = 0.0
+    is_available = True
+
+
+def _bias_frame(*biases, start="2026-01-01 00:00"):
+    import pandas as pd
+    return pd.DataFrame({"timestamp": pd.date_range(start, periods=len(biases), freq="15min"), "trend_bias": list(biases)})
+
+
+def _seconds(when):
+    import pandas as pd
+    return (pd.Timestamp(when) - pd.Timestamp(0)).total_seconds()
+
+
+def test_counter_trend_entry_is_not_a_flip():
+    from pipeline import trend_was_with_position_since_entry as flipped
+    df = _bias_frame("SHORT", "SHORT", "SHORT")
+    assert not flipped(df, "LONG", _seconds("2026-01-01 00:16"))
+
+
+def test_trend_turning_against_after_being_with_the_position_is_a_flip():
+    from pipeline import trend_was_with_position_since_entry as flipped
+    assert flipped(_bias_frame("LONG", "LONG", "SHORT"), "LONG", _seconds("2026-01-01 00:01"))  # aligned entry
+    assert flipped(_bias_frame("SHORT", "LONG", "SHORT"), "LONG", _seconds("2026-01-01 00:01"))  # counter-trend, then with, then against
+
+
+def test_trend_before_the_entry_bar_does_not_count():
+    from pipeline import trend_was_with_position_since_entry as flipped
+    assert not flipped(_bias_frame("LONG", "SHORT", "SHORT"), "LONG", _seconds("2026-01-01 00:16"))
+
+
+def test_unknown_or_old_entry_time_keeps_the_plain_trend_exit():
+    from pipeline import trend_was_with_position_since_entry as flipped
+    df = _bias_frame("SHORT", "SHORT")
+    assert flipped(df, "LONG", 0.0)
+    assert flipped(df, "LONG", _seconds("2025-12-01 00:00"))
+
+
+def test_exit_engine_applies_the_flip_only_when_told_it_is_one():
+    from utils.exit_engine import ExitAction, ExitEngine
+    from utils.schemas import PositionSchema
+    pos = PositionSchema(symbol="AAAUSDT", side="LONG", amount=1.0, entry_price=100.0, stop_loss=95.0)
+    assert ExitEngine().compute_exit(pos, 100.0, 1.0, "SHORT", "TREND", trend_flipped=False)[2] != "TREND_FLIP_EXIT"
+    action, _, reason, _ = ExitEngine().compute_exit(pos, 100.0, 1.0, "SHORT", "TREND", trend_flipped=True)
+    assert action == ExitAction.FULL_CLOSE and reason == "TREND_FLIP_EXIT"
+    # The hard stop still works on a counter-trend position.
+    assert ExitEngine().compute_exit(pos, 94.0, 1.0, "SHORT", "TREND", trend_flipped=False)[2] == "STOP_LOSS_HIT"
+
+
+def test_entry_time_survives_event_projection():
+    from utils.event_sourced_runtime import OwnershipRegistry
+    owner = OwnershipRegistry().get_owner("ENTRYTIMEUSDT")
+    owner.submit_event("ENTRY_FILLED", {"side": "LONG", "amount": 1.0, "price": 100.0})
+    owner.submit_event("RECONCILE_CORRECTION", {"atr": 2.0, "timestamp": 1234.5})
+    assert owner.get_state().timestamp == 1234.5
+    owner.submit_event("POSITION_CLOSED", {})

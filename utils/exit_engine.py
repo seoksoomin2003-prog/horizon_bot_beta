@@ -19,7 +19,7 @@ class ExitEngine:
         self.VOL_COLLAPSE_MULT = 0.7
         self.TIME_EXIT_CANDLES = 288  # 15m = 3 days
 
-    def compute_exit(self, pos: PositionSchema, current_price: float, current_atr: float, trend_bias: str, regime: str, min_qty: float = 0.0):
+    def compute_exit(self, pos: PositionSchema, current_price: float, current_atr: float, trend_bias: str, regime: str, min_qty: float = 0.0, trend_flipped: bool = True):
         """
         Hardened Institutional Exit Computation (Typed Schema version).
         Returns: (ExitAction, amount_to_close, reason, new_stop_price)
@@ -64,8 +64,8 @@ class ExitEngine:
         if current_atr > 0 and atr_entry > 0 and current_atr < (atr_entry * self.VOL_COLLAPSE_MULT):
             return ExitAction.FULL_CLOSE, amount, "VOL_COLLAPSE_EXIT", None
 
-        # 4. TREND FLIP
-        if regime in ['TREND', 'LOW_VOL']:
+        # 4. TREND FLIP (only a flip after entry: a counter-trend entry is opposed from the start, which is no flip)
+        if trend_flipped and regime in ['TREND', 'LOW_VOL']:
             if (side == 'LONG' and trend_bias == 'SHORT') or (side == 'SHORT' and trend_bias == 'LONG'):
                 return ExitAction.FULL_CLOSE, amount, "TREND_FLIP_EXIT", None
 
