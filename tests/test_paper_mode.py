@@ -472,12 +472,14 @@ def _entry_pipeline(approved=True):
     from risk_engine import RiskEngine
     p = Pipeline.__new__(Pipeline)
     p._worker_lock = threading.RLock()
+    p._entry_gate_lock = threading.Lock()
     p.active_entry_workers = {}
     p.signal_generated_count = p.execution_attempt_count = p.risk_rejection_count = 0
     p.dh, p.signal, p.conviction, p.state, p.execution = (MagicMock() for _ in range(5))
     p.state.lock = threading.RLock()
     p.state.last_entry_bar_ts = {}
     p.state.is_position_active.return_value = False
+    p.state.active_positions = []
     p.dh.fetch_active_positions.return_value = []
     p.dh.fetch_ticker.return_value = MagicMock(last=100.0)
     p.dh.fetch_orderbook.return_value = {"bids": [[99.9, 10.0]], "asks": [[100.1, 10.0]]}
@@ -529,10 +531,10 @@ def test_healthy_worker_still_orders(allow_entries):
 
 
 def test_claim_marks_lease_as_ordering(allow_entries):
-    from pipeline import LEASE_ORDERING
+    from pipeline import CLAIMED, LEASE_ORDERING
     p, lease_for = _entry_pipeline()
     lease = lease_for("AAAUSDT")
-    assert p._claim_entry_order("AAAUSDT", lease)
+    assert p._claim_entry_order("AAAUSDT", lease) == CLAIMED
     assert lease.status == LEASE_ORDERING
 
 
@@ -542,6 +544,73 @@ def test_parallel_entries_cannot_exceed_the_minute_limit(allow_entries):
         p._process_single_entry(sym, MagicMockAccount(), lease_for(sym))
     assert p.execution.execute_firm_order.call_count == config.MAX_TRADES_PER_MINUTE
     assert len(p.risk.trade_timestamps) == config.MAX_TRADES_PER_MINUTE
+
+
+def _held(*symbols):
+    from unittest.mock import MagicMock
+    return [MagicMock(symbol=s) for s in symbols]
+
+
+def test_parallel_entries_cannot_exceed_the_position_limit(allow_entries):
+    """Workers approved at the same moment each see the same count; only the last check before ordering can stop them."""
+    import threading
+    p, lease_for = _entry_pipeline()
+    p.state.active_positions = _held("HELD1USDT", "HELD2USDT")
+    both_approved = threading.Barrier(2, timeout=5)
+    approve = p.risk.approve_order.return_value
+    def approve_order(**kwargs):
+        both_approved.wait()
+        return approve
+    p.risk.approve_order = approve_order
+    order_may_finish = threading.Event()
+    def slow_order(request):
+        assert order_may_finish.wait(5)
+    p.execution.execute_firm_order.side_effect = slow_order
+    leases = {s: lease_for(s) for s in ("AAAUSDT", "BBBUSDT")}
+    workers = [threading.Thread(target=p._process_single_entry, args=(s, MagicMockAccount(), l)) for s, l in leases.items()]
+    for w in workers:
+        w.start()
+    deadline = time.time() + 5
+    while p.risk_rejection_count == 0 and p.execution.execute_firm_order.call_count < 2 and time.time() < deadline:
+        time.sleep(0.01)
+    order_may_finish.set()
+    for w in workers:
+        w.join(5)
+    assert p.execution.execute_firm_order.call_count == 1
+    assert p.risk_rejection_count == 1
+    assert len(p.risk.trade_timestamps) == 1  # the refused worker returned its slot
+
+
+def test_order_still_being_sent_holds_a_position_slot(allow_entries):
+    from pipeline import CLAIMED
+    p, lease_for = _entry_pipeline()
+    p.state.active_positions = _held("HELD1USDT", "HELD2USDT")
+    assert p._claim_entry_order("AAAUSDT", lease_for("AAAUSDT")) == CLAIMED
+    assert p._claim_entry_order("BBBUSDT", lease_for("BBBUSDT")) != CLAIMED
+
+
+def test_failed_order_gives_its_slot_back(allow_entries):
+    p, lease_for = _entry_pipeline()
+    p.state.active_positions = _held("HELD1USDT", "HELD2USDT")
+    p._process_single_entry("AAAUSDT", MagicMockAccount(), lease_for("AAAUSDT"))  # the stubbed order returns None
+    p.risk.trade_timestamps = []
+    p._process_single_entry("BBBUSDT", MagicMockAccount(), lease_for("BBBUSDT"))
+    assert p.execution.execute_firm_order.call_count == 2
+
+
+def test_order_already_in_position_list_is_not_counted_twice(allow_entries):
+    from pipeline import CLAIMED, LEASE_ORDERING
+    p, lease_for = _entry_pipeline()
+    p.state.active_positions = _held("HELD1USDT", "AAAUSDT")
+    lease_for("AAAUSDT").status = LEASE_ORDERING  # filled, worker not finished yet
+    assert p._claim_entry_order("BBBUSDT", lease_for("BBBUSDT")) == CLAIMED
+
+
+def test_entry_is_refused_when_already_over_the_limit(allow_entries):
+    p, lease_for = _entry_pipeline()
+    p.state.active_positions = _held("A1USDT", "A2USDT", "A3USDT", "A4USDT")
+    p._process_single_entry("AAAUSDT", MagicMockAccount(), lease_for("AAAUSDT"))
+    p.execution.execute_firm_order.assert_not_called()
 
 
 def test_rate_limit_is_named_for_what_it_counts():

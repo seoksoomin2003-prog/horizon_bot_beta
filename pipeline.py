@@ -29,6 +29,7 @@ WAKE_GAP_SECONDS = 60.0
 # or replaced, or the same symbol could be ordered twice. The limit only guards against a thread that never returns.
 LEASE_ORDERING = "ORDERING"
 ORDER_IN_FLIGHT_LIMIT_SECONDS = 120.0
+CLAIMED, STALE_WORKER, POSITION_LIMIT = "CLAIMED", "STALE_WORKER", "POSITION_LIMIT"
 
 
 def trend_was_with_position_since_entry(df, side: str, opened_at: float) -> bool:
@@ -77,6 +78,7 @@ class Pipeline:
         # Concurrency Shield Registry for active workers (Target A)
         import concurrent.futures
         self._worker_lock = threading.Lock()
+        self._entry_gate_lock = threading.Lock()
         self.active_entry_workers = {} # {symbol: WorkerLease}
         self.active_exit_workers = {}  # {symbol: WorkerLease}
         
@@ -528,13 +530,26 @@ class Pipeline:
                 if current_lease and current_lease.thread_id == threading.get_ident():
                     self.active_exit_workers.pop(pos.symbol, None)
 
-    def _claim_entry_order(self, symbol: str, lease: WorkerLease) -> bool:
-        """Last check before an order: False if this worker was flagged as hung or replaced."""
-        with self._worker_lock:
-            if lease.status == "STALLED" or self.active_entry_workers.get(symbol) is not lease:
-                return False
-            lease.status = LEASE_ORDERING
-            return True
+    def _claim_entry_order(self, symbol: str, lease: WorkerLease) -> str:
+        """Last check before an order, returning CLAIMED or why not.
+
+        Workers approved together all saw the same position count, so it is counted again here, one claim at a
+        time, with orders still being sent included. An order that finishes between the two reads below is in
+        the lease list, the position list or both, never neither. The position read is slow, so it stays outside
+        _worker_lock, which the main cycle needs.
+        """
+        import config
+        with self._entry_gate_lock:
+            with self._worker_lock:
+                sending = {s for s, other in self.active_entry_workers.items() if other.status == LEASE_ORDERING}
+            taken = sending | {p.symbol for p in self.state.active_positions}
+            with self._worker_lock:
+                if lease.status == "STALLED" or self.active_entry_workers.get(symbol) is not lease:
+                    return STALE_WORKER
+                if len(taken - {symbol}) >= config.MAX_CONCURRENT_POSITIONS:
+                    return POSITION_LIMIT
+                lease.status = LEASE_ORDERING
+                return CLAIMED
 
     def _process_single_entry(self, symbol: str, account, lease: WorkerLease):
         """
@@ -644,9 +659,14 @@ class Pipeline:
                     trades_logger.info(f"[REJECTED: RATE_LIMIT] {symbol}: entry limit per minute reached")
                     return
 
-                if not self._claim_entry_order(symbol, lease):
+                claim = self._claim_entry_order(symbol, lease)
+                if claim != CLAIMED:
                     self.risk.release_entry_slot()
-                    trades_logger.warning(f"[ENTRY ABORTED: STALE WORKER] {symbol}: worker timed out before ordering, no order sent")
+                    if claim == POSITION_LIMIT:
+                        self.risk_rejection_count += 1
+                        trades_logger.info(f"[REJECTED: POSITION_LIMIT] {symbol}: position limit reached by an entry at the same moment, no order sent")
+                    else:
+                        trades_logger.warning(f"[ENTRY ABORTED: STALE WORKER] {symbol}: worker timed out before ordering, no order sent")
                     return
 
                 self.execution_attempt_count += 1
