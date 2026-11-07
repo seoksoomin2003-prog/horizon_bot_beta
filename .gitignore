@@ -14,3 +14,6 @@ logs/paper/
 runtime/paper_*/
 .venv/
 .run/
+
+# Historical replay data and runs
+replay_data/
