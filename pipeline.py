@@ -464,8 +464,9 @@ class Pipeline:
                 from utils.journal import ExecutionJournal, JournalEvent
                 ExecutionJournal.log_event(pos.symbol, JournalEvent.TP1_TRIGGERED if tp_level == 1 else JournalEvent.TP2_TRIGGERED)
 
+                stop_before = pos.sl_plan_id
                 result = self.execution.close_partial(
-                    pos.symbol, 
+                    pos.symbol,
                     pos, 
                     amount, 
                     min_qty=min_qty, 
@@ -499,7 +500,10 @@ class Pipeline:
                             "amount": filled,
                             "order_id": order_id
                         })
-            
+                        # The partial close replaced the stop, and positions are rebuilt from events.
+                        if pos.sl_plan_id != stop_before:
+                            owner.submit_event("SL_MOVED", {"price": pos.stop_loss, "order_id": pos.sl_plan_id})
+
             elif action == ExitAction.UPDATE_STOP:
                 if hasattr(self.state, "_active_positions_override") and self.state._active_positions_override is not None:
                     if self.execution.atomic_stop_update(pos.symbol, pos, new_stop):

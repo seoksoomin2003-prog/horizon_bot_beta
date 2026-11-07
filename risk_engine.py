@@ -31,8 +31,8 @@ class RiskEngine:
     def __init__(self):
         self.lock = threading.RLock()
         self.consecutive_losses = 0
-        self.cooldown_active = False
-        
+        self.cooldown_until = 0.0
+
         # Capital Protection State
         self.trade_timestamps = []
         self.equity_history = [] # List of (timestamp, equity)
@@ -109,6 +109,11 @@ class RiskEngine:
             intent_id=intent_id,
             approved=True
         )
+
+    @property
+    def cooldown_active(self) -> bool:
+        """Ends with time as well as with a win: with no position open there is no trade left to clear it."""
+        return time.time() < self.cooldown_until
 
     def _load_performance(self) -> List[PerformanceTrade]:
         """
@@ -426,8 +431,8 @@ class RiskEngine:
         Update performance history with institutional percentage metrics.
         """
         with self.lock:
-            from config import COOLDOWN_AFTER_LOSSES
-            
+            from config import COOLDOWN_AFTER_LOSSES, COOLDOWN_AFTER_LOSSES_SECONDS
+
             pnl_pct = pnl / entry_equity if entry_equity > 0 else 0
             r_multiple = pnl / risk_amount if risk_amount > 0 else 0
             
@@ -446,14 +451,17 @@ class RiskEngine:
             self._save_performance()
     
             if pnl < 0:
+                if self.cooldown_until and not self.cooldown_active:  # a finished cooldown settled the earlier losses
+                    self.consecutive_losses = 0
+                    self.cooldown_until = 0.0
                 self.consecutive_losses += 1
                 self.hourly_trades.setdefault(symbol, []).append(time.time())
                 if self.consecutive_losses >= COOLDOWN_AFTER_LOSSES:
-                    self.cooldown_active = True
-                    trades_logger.info("[WARN] COOLDOWN ACTIVATED due to 3 consecutive losses.")
+                    self.cooldown_until = time.time() + COOLDOWN_AFTER_LOSSES_SECONDS
+                    trades_logger.info(f"[WARN] COOLDOWN ACTIVATED due to {self.consecutive_losses} consecutive losses, for {COOLDOWN_AFTER_LOSSES_SECONDS // 60} minutes.")
             else:
                 self.consecutive_losses = 0
-                self.cooldown_active = False
+                self.cooldown_until = 0.0
 
     def check_system_health(self, current_equity: float, is_available: bool = True) -> tuple:
         """

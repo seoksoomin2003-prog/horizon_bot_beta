@@ -29,7 +29,6 @@ class ExitEngine:
             return ExitAction.EMERGENCY_RECOVERY, 0, "INVALID_STATE", None
             
         if getattr(pos, "status", "") == "dust_quarantined":
-            from logger import trades_logger
             trades_logger.debug(f"[{pos.symbol}] Ignoring exit logic for terminal dust.")
             return ExitAction.HOLD, 0.0, "DUST_QUARANTINE", None
         

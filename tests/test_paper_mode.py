@@ -720,3 +720,124 @@ def test_entry_time_survives_event_projection():
     owner.submit_event("RECONCILE_CORRECTION", {"atr": 2.0, "timestamp": 1234.5})
     assert owner.get_state().timestamp == 1234.5
     owner.submit_event("POSITION_CLOSED", {})
+
+
+def _engine_at(monkeypatch, clock):
+    from risk_engine import RiskEngine
+    monkeypatch.setattr(time, "time", lambda: clock["now"])
+    monkeypatch.setattr(RiskEngine, "_save_performance", lambda self: None)
+    return RiskEngine()
+
+
+def _lose(r, times=1):
+    for _ in range(times):
+        r.record_trade_result("AAAUSDT", -1.0, 10.0, 1000.0)
+
+
+def test_cooldown_ends_by_itself_with_no_trades(monkeypatch):
+    """A flat bot makes no trades, so a cooldown that only a win can clear would never end."""
+    clock = {"now": 1_000_000.0}
+    r = _engine_at(monkeypatch, clock)
+    _lose(r, 3)
+    assert r.cooldown_active
+    clock["now"] += config.COOLDOWN_AFTER_LOSSES_SECONDS - 1
+    assert r.cooldown_active
+    clock["now"] += 1
+    assert not r.cooldown_active
+
+
+def test_loss_count_starts_over_after_a_cooldown(monkeypatch):
+    clock = {"now": 1_000_000.0}
+    r = _engine_at(monkeypatch, clock)
+    _lose(r, 3)
+    clock["now"] += config.COOLDOWN_AFTER_LOSSES_SECONDS
+    _lose(r, 2)
+    assert not r.cooldown_active
+    _lose(r)
+    assert r.cooldown_active
+
+
+def test_win_still_ends_a_cooldown_early(monkeypatch):
+    r = _engine_at(monkeypatch, {"now": 1_000_000.0})
+    _lose(r, 3)
+    r.record_trade_result("AAAUSDT", 1.0, 10.0, 1000.0)
+    assert not r.cooldown_active and r.consecutive_losses == 0
+
+
+def test_two_losses_do_not_start_a_cooldown(monkeypatch):
+    r = _engine_at(monkeypatch, {"now": 1_000_000.0})
+    _lose(r, 2)
+    assert not r.cooldown_active
+
+
+def test_partial_close_below_minimum_size_is_skipped_not_an_error():
+    from utils.exit_engine import ExitAction, ExitEngine
+    from utils.schemas import PositionSchema
+    pos = PositionSchema(symbol="AAAUSDT", side="LONG", amount=0.001, entry_price=100.0, stop_loss=90.0, atr=5.0)
+    action, _, _, _ = ExitEngine().compute_exit(pos, 111.0, 5.0, "LONG", "TREND", min_qty=0.01)
+    assert action != ExitAction.PARTIAL_CLOSE_TP1
+
+
+def test_float_noise_does_not_leave_an_unclosable_remainder(broker):
+    """5.39 - 2.15 - 3.23 is 0.00999..., below the 0.01 minimum, which no order could close."""
+    broker.create_order(SYM, "market", "buy", 5.39)
+    broker.create_order(SYM, "market", "sell", 2.15, None, {"reduceOnly": True})
+    broker.create_order(SYM, "market", "sell", 3.23, None, {"reduceOnly": True})
+    assert broker.state["positions"][SYM]["amount"] == 0.01
+
+
+def test_remainder_saved_with_float_noise_is_repaired_on_load(tmp_path):
+    path = tmp_path / "broker.json"
+    b = PaperBroker(str(path))
+    b.state["positions"][SYM] = {"side": "SHORT", "amount": 0.009999999999999787, "entry": 10.0, "opened_ms": 1}
+    b._save()
+    assert PaperBroker(str(path)).state["positions"][SYM]["amount"] == 0.01
+
+
+def test_stop_after_partial_close_covers_the_whole_remainder():
+    """3.2399999... was cut to 3.23 by amount precision, so the stop left 0.01 behind."""
+    from tests.test_execution_partial_close import _FakeDH, _FakeExchange
+    from execution_engine import ExecutionEngine
+    from utils.schemas import PositionSchema
+    ex = _FakeExchange()
+    eng = ExecutionEngine(_FakeDH(ex), simulation_mode=False)
+    pos = PositionSchema(symbol="BTCUSDT", side="LONG", amount=5.39, entry_price=100.0, stop_loss=90.0)
+    eng.close_partial("BTCUSDT", pos, 2.15, min_qty=0.0)
+    assert pos.amount == 3.24
+    assert ex._orders[-1]["amount"] == 3.24
+
+
+@pytest.mark.parametrize("tp_action, filled_event", [("PARTIAL_CLOSE_TP1", "TP1_FILLED"), ("PARTIAL_CLOSE_TP2", "TP2_FILLED")])
+def test_stop_replaced_by_a_partial_close_is_recorded(tmp_path, tp_action, filled_event):
+    """Positions are rebuilt from events, so without this the next stop update cancels the old, gone stop."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import threading
+    import pandas as pd
+    from pipeline import Pipeline, WorkerLease
+    from utils.event_sourced_runtime import OwnershipRegistry
+    from utils.exit_engine import ExitAction
+    symbol = f"STOPKEEP{filled_event[:3]}USDT"
+    owner = OwnershipRegistry().get_owner(symbol)
+    owner.submit_event("ENTRY_FILLED", {"side": "LONG", "amount": 1.0, "price": 100.0})
+    owner.submit_event("SL_PLACED", {"price": 95.0, "order_id": "OLD"})
+    if filled_event == "TP2_FILLED":
+        owner.submit_event("TP1_FILLED", {"amount": 0.2})
+    p = Pipeline.__new__(Pipeline)
+    p._worker_lock = threading.Lock()
+    p.active_exit_workers = {}
+    p.state = SimpleNamespace(lock=threading.RLock(), persist=lambda: None)
+    p.dh, p.signal, p.risk, p.execution, p.exit = (MagicMock() for _ in range(5))
+    p.signal.compute_all_signals.return_value = pd.DataFrame([{"timestamp": 1, "atr": 1.0}])
+    p.dh.fetch_ticker.return_value = MagicMock(last=110.0)
+    p.exit.compute_exit.return_value = (ExitAction[tp_action], 0.2, "TP", 100.0)
+    def close_partial(sym, pos, amount, min_qty=0.0, new_stop=None):
+        pos.sl_plan_id = "NEW"
+        pos.stop_loss = new_stop or pos.stop_loss
+        return {"ok": True, "order_id": "X", "filled_amount": amount}
+    p.execution.close_partial.side_effect = close_partial
+    p._process_single_exit(owner.get_state(), WorkerLease(symbol, "EXIT"))
+    state = owner.get_state()
+    assert state.sl_plan_id == "NEW"
+    assert state.stop_loss == (100.0 if filled_event == "TP1_FILLED" else 95.0)
+    owner.submit_event("POSITION_CLOSED", {})

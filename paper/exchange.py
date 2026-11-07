@@ -28,6 +28,7 @@ TP_TYPES = {"TAKE_PROFIT_MARKET", "TAKE_PROFIT"}
 MINUTE_MS = 60_000
 MAX_REPLAY_BARS = 1000
 RECENT_LIMIT = 500
+AMOUNT_DECIMALS = 10
 
 
 class PaperBlocked(AttributeError):
@@ -55,7 +56,10 @@ class PaperBroker:
     def _load(self, initial: float) -> dict:
         if os.path.exists(self.state_path):
             with open(self.state_path) as f:
-                return json.load(f)
+                state = json.load(f)
+            for pos in state["positions"].values():
+                pos["amount"] = round(pos["amount"], AMOUNT_DECIMALS)
+            return state
         return {"initial": initial, "cash": initial, "realized": 0.0, "fees": 0.0, "seq": 0, "positions": {},
                 "orders": {}, "done": {}, "trades": [], "last_checked": {}}
 
@@ -104,16 +108,16 @@ class PaperBroker:
             closed = min(qty, pos["amount"])
             direction = 1.0 if pos["side"] == "LONG" else -1.0
             realized = direction * (price - pos["entry"]) * closed
-            pos["amount"] -= closed
+            pos["amount"] = round(pos["amount"] - closed, AMOUNT_DECIMALS)   # a real exchange keeps exact sizes
             filled += closed
-            qty -= closed
+            qty = round(qty - closed, AMOUNT_DECIMALS)
             if pos["amount"] <= 1e-12:
                 self.state["positions"].pop(symbol)
                 pos = None
         if qty > 0 and not order.get("reduce_only"):
             pos = self.state["positions"].get(symbol)
             if pos:
-                total = pos["amount"] + qty
+                total = round(pos["amount"] + qty, AMOUNT_DECIMALS)
                 pos["entry"] = (pos["entry"] * pos["amount"] + price * qty) / total
                 pos["amount"] = total
             else:

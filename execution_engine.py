@@ -892,7 +892,8 @@ class ExecutionEngine:
             pos.remaining_qty = max(0.0, current_amount - filled)
             pos.cumulative_fill_ratio = filled / clamped if clamped > 0 else 0.0
 
-            remaining_est = max(0.0, current_amount - filled)
+            # Rounded because amount precision truncates: 3.2399999... would become 3.23 and leave 0.01 unprotected.
+            remaining_est = round(max(0.0, current_amount - filled), 10)
             try:
                 pos.amount = remaining_est
             except Exception:
