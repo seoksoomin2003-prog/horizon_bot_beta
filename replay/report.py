@@ -91,7 +91,7 @@ def render(summary: dict, a: dict) -> str:
         f"기간: {_month(summary['start_ms'])} ~ {_month(summary['reached_ms'])} ({a['days']:.0f}일), 비용 가정: 수수료 {summary['fee_rate']:.2%}, 슬리피지 {summary['slippage_bps']:.0f}bp",
         "",
         f"시작 {summary['initial']:,.2f} → 현금 {a['final_cash']:,.2f} USDT ({a['return']:+.2%}), 최대 낙폭 {a['max_drawdown']:.2%}",
-        f"비용 전 손익 {a['gross']:+,.2f} / 수수료 -{a['fees']:,.2f} / 자금조달비 {-a['funding']:+,.2f}",
+        f"슬리피지 반영, 수수료 전 손익 {a['gross']:+,.2f} / 수수료 -{a['fees']:,.2f} / 자금조달비 {-a['funding']:+,.2f}",
         f"포지션 {a['positions']}건(하루 {a['per_day']:.1f}건), 승률 {_num(a['win_rate'], '.1%')}, 손익비 {_num(a['profit_factor'])}",
         f"평균 이익 {_num(a['avg_win'])} / 평균 손실 {_num(a['avg_loss'])} / 포지션당 평균 {_num(a['avg_pnl'], '.3f')} USDT "
         f"(95% 구간 {_num(a['avg_pnl_low'], '.3f')} ~ {_num(a['avg_pnl_high'], '.3f')})",
