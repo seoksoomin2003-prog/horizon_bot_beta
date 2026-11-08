@@ -128,7 +128,8 @@ def build_summary(root: Path, cache: Optional[dict] = None, now: Optional[float]
     result = {"now_ms": now * 1000, "has_data": state is not None, "bot": bot_status(root, mtime, now),
               "settings": paper_settings.load(root / "runtime"), "run_settings": (state or {}).get("settings"),
               "limits": {"max_leverage": paper_settings.MAX_LEVERAGE, "min_initial": paper_settings.MIN_INITIAL,
-                         "fees": paper_settings.FEES}}
+                         "fees": paper_settings.FEES},
+              "past_runs": past_runs(root)}
     log_dir = root / "logs" / "paper"
     errors = log_entries(log_dir / "errors.log")
     result["error_count_recent"] = len(errors)
@@ -157,15 +158,25 @@ def build_summary(root: Path, cache: Optional[dict] = None, now: Optional[float]
             row["wins"] += t["realized"] - t["fee"]["cost"] > 0
 
     orders = list(state.get("orders", {}).values())
+    run_settings = state.get("settings") or {}
+    marks = state.get("marks", {})
     positions = []
+    unrealized_total = 0.0
     for symbol, p in state.get("positions", {}).items():
         mine = [o for o in orders if o.get("symbol") == symbol]
         stop = next((o.get("trigger") for o in mine if str(o.get("type", "")).startswith("STOP")), None)
         take = next((o.get("trigger") for o in mine if str(o.get("type", "")).startswith("TAKE_PROFIT")), None)
+        mark = marks.get(symbol)
+        unrealized = None if mark is None else (1 if p["side"] == "LONG" else -1) * (mark - p["entry"]) * p["amount"]
+        unrealized_total += unrealized or 0.0
+        lev = float(run_settings.get("leverage") or 0)
+        liq = paper_settings.liquidation_price(p["side"], p["entry"], lev) if run_settings.get("market") == "futures" and lev > 0 else None
         positions.append({"symbol": symbol, "side": p["side"], "amount": p["amount"], "entry": p["entry"],
-                          "opened_ms": p.get("opened_ms"), "stop": stop, "take_profit": take})
+                          "opened_ms": p.get("opened_ms"), "stop": stop, "take_profit": take, "mark": mark,
+                          "unrealized": unrealized, "liquidation": liq})
     result.update({
         "initial": initial, "cash": state["cash"], "return": state["cash"] / initial - 1, "realized": state["realized"],
+        "equity": state["cash"] + unrealized_total, "marks_ms": state.get("marks_ms"),
         "fees": state["fees"], "fills": len(fills), "closes": len(closes), "wins": len(wins),
         "win_rate": len(wins) / len(closes) if closes else None, "drawdown": drawdown, "positions": positions,
         "open_orders": len(orders), "curve": curve, "first_ms": fills[0]["timestamp"] if fills else None,
@@ -173,6 +184,25 @@ def build_summary(root: Path, cache: Optional[dict] = None, now: Optional[float]
         "recent_fills": [fill_view(t) for t in fills[-MAX_FILLS:]][::-1],
     })
     return result
+
+
+def past_runs(root: Path, limit: int = 20) -> list[dict]:
+    """One row per archived paper run, newest first. Reads only the archive folder."""
+    rows = []
+    for broker in (root / "runtime" / "archive").glob("*/paper_*/paper_broker.json"):
+        try:
+            state = json.loads(broker.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        fills = read_ledger(broker.parent / "paper_trades.jsonl")
+        closes = [t for t in fills if t.get("realized")]
+        initial = float(state.get("initial") or 0) or None
+        rows.append({"name": broker.parent.parent.name, "settings": state.get("settings"), "initial": initial,
+                     "cash": state.get("cash"), "return": state["cash"] / initial - 1 if initial else None,
+                     "fills": len(fills), "closes": len(closes), "open_positions": len(state.get("positions", {})),
+                     "first_ms": fills[0]["timestamp"] if fills else None, "last_ms": fills[-1]["timestamp"] if fills else None})
+    rows.sort(key=lambda r: r["name"], reverse=True)
+    return rows[:limit]
 
 
 def run_script(root: Path, *args: str) -> tuple[bool, str]:

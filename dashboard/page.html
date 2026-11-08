@@ -109,6 +109,7 @@ button:disabled { opacity: .5; cursor: default; }
       <div class="label" id="return"></div>
     </div>
     <dl class="kpis">
+      <div><dt>평가 자산 (미실현 포함)</dt><dd id="equity">-</dd></div>
       <div><dt>실현 손익</dt><dd id="realized">-</dd></div>
       <div><dt>수수료</dt><dd id="fees">-</dd></div>
       <div><dt>청산 (부분 포함)</dt><dd id="closes">-</dd></div>
@@ -126,9 +127,10 @@ button:disabled { opacity: .5; cursor: default; }
   <section class="card">
     <h2>보유 포지션</h2>
     <div class="scroll"><table>
-      <thead><tr><th>코인</th><th>방향</th><th class="num">수량</th><th class="num">진입가</th><th class="num">손절 주문</th><th class="num">익절 주문</th><th>진입 시각</th></tr></thead>
+      <thead><tr><th>코인</th><th>방향</th><th class="num">수량</th><th class="num">진입가</th><th class="num">현재가</th><th class="num">평가손익 (USDT)</th><th class="num">손절 주문</th><th class="num">강제청산가</th><th>진입 시각</th></tr></thead>
       <tbody id="positions"></tbody>
     </table></div>
+    <div class="label" id="marknote"></div>
   </section>
 
   <div class="columns">
@@ -150,6 +152,14 @@ button:disabled { opacity: .5; cursor: default; }
     <div class="scroll"><table>
       <thead><tr><th>시각</th><th>코인</th><th>구분</th><th>사유</th><th class="num">가격</th><th class="num">수량</th><th class="num">손익 (USDT)</th><th class="num">수수료</th></tr></thead>
       <tbody id="fills"></tbody>
+    </table></div>
+  </section>
+
+  <section class="card">
+    <h2>지난 가상 매매 기록 <span class="label">새로 시작할 때 보관된 기록</span></h2>
+    <div class="scroll"><table>
+      <thead><tr><th>보관 이름</th><th>설정</th><th>기간</th><th class="num">시작 자금</th><th class="num">마지막 현금</th><th class="num">수익률</th><th class="num">청산</th><th class="num">남은 포지션</th></tr></thead>
+      <tbody id="pastruns"></tbody>
     </table></div>
   </section>
 
@@ -243,12 +253,27 @@ function fillRows(id, rows, emptyText, cols) {
   const tr = document.createElement("tr"); tr.append(td);
   body.replaceChildren(tr);
 }
-function fillLog(id, entries, emptyText) {
+const TAGS = [
+  [/^\[ENTRY APPROVED\] (\S+) (LONG|SHORT) \(Size: ([\d.e-]+).*$/, (m) => `진입 승인: ${m[1]} ${m[2] === "LONG" ? "롱" : "숏"} ${Number(m[3]).toPrecision(4)}개`],
+  [/^\[MIN_ORDER\] (\S+) (LONG|SHORT): raised to exchange minimum \S+ -> (\S+) \(([\d.]+) USDT\), risk to stop ([\d.]+%) of equity$/,
+    (m) => `최소 주문으로 올림: ${m[1]} ${m[3]}개 (${m[4]} USDT, 손절까지 위험 자금의 ${m[5]})`],
+  [/^\[SKIPPED: PAPER_RULES\] (\S+) (LONG|SHORT): spot has no short selling$/, (m) => `건너뜀: ${m[1]} 숏 (현물은 숏 불가)`],
+  [/^\[SKIPPED: PAPER_RULES\] (\S+) (LONG|SHORT): (.*)$/, (m) => `건너뜀: ${m[1]} ${m[2] === "LONG" ? "롱" : "숏"} (${m[3]})`],
+  [/^\[STARTUP\] (.*)$/, (m) => `시작 점검: ${m[1]}`],
+  [/^\[TIMEOUT\] (.*)$/, (m) => `응답 지연: ${m[1]}`],
+  [/COOLDOWN ACTIVATED/, () => "손실 3연속으로 1시간 진입 중지"],
+];
+function readable(text) {
+  for (const [re, fmt] of TAGS) { const m = text.match(re); if (m) return fmt(m); }
+  return text;
+}
+function fillLog(id, entries, emptyText, translate) {
   const items = entries.map((e) => {
     const li = document.createElement("li");
     const t = document.createElement("time");
     t.textContent = e.time.slice(5, 16);
-    li.append(t, e.text);
+    li.append(t, translate ? readable(e.text) : e.text);
+    if (translate && readable(e.text) !== e.text) li.title = e.text;
     return li;
   });
   if (!items.length) {
@@ -353,11 +378,16 @@ function render(d) {
   }
   $("errcount").textContent = d.error_count_recent ? `최근 ${d.error_count_recent}건` : "";
   fillLog("errors", d.errors, "최근 오류가 없습니다.");
-  fillLog("activity", d.activity, "아직 기록된 활동이 없습니다.");
+  fillLog("activity", d.activity, "아직 기록된 활동이 없습니다.", true);
+  fillRows("pastruns", (d.past_runs || []).map((r) => row([[r.name.replace(/^paper_/, "")], [r.settings ? settingsText(r.settings) : "설정 기록 없음"],
+    [r.first_ms ? `${when(r.first_ms)} ~ ${when(r.last_ms)}` : "체결 없음"], [r.initial == null ? "없음" : money(r.initial), 1],
+    [r.cash == null ? "없음" : money(r.cash), 1], [r.return == null ? "없음" : (r.return > 0 ? "+" : "") + pct(r.return), 1], [r.closes, 1], [r.open_positions, 1]])),
+    "보관된 기록이 없습니다.", 8);
   if (!d.has_data) return drawChart();
 
   $("cash").textContent = money(d.cash);
   $("return").textContent = `시작 자금 ${money(d.initial)} USDT 대비 ${d.return > 0 ? "+" : ""}${pct(d.return)}`;
+  $("equity").textContent = money(d.equity);
   $("realized").textContent = signed(d.realized);
   $("fees").textContent = money(d.fees);
   $("closes").textContent = `${d.closes}건`;
@@ -367,7 +397,8 @@ function render(d) {
   sample.hidden = d.closes >= SAMPLE_GUIDE;
   sample.textContent = `청산 ${d.closes}건입니다. 표본이 적어 이 수치로 수익성을 판단할 수 없습니다. (${SAMPLE_GUIDE}건은 최소한의 참고선이며, 넘어도 수익을 보장하지 않습니다.)`;
 
-  fillRows("positions", d.positions.map((p) => row([[sym(p.symbol)], [p.side === "LONG" ? "롱" : "숏"], [price(p.amount), 1], [price(p.entry), 1], [price(p.stop), 1], [price(p.take_profit), 1], [when(p.opened_ms)]])), "보유 포지션이 없습니다.", 7);
+  fillRows("positions", d.positions.map((p) => row([[sym(p.symbol)], [p.side === "LONG" ? "롱" : "숏"], [price(p.amount), 1], [price(p.entry), 1], [price(p.mark), 1], [p.unrealized == null ? "없음" : signed(p.unrealized, 3), 1], [price(p.stop), 1], [p.liquidation == null ? "해당 없음" : price(p.liquidation), 1], [when(p.opened_ms)]])), "보유 포지션이 없습니다.", 9);
+  $("marknote").textContent = d.positions.length && d.marks_ms ? `현재가는 봇이 ${when(d.marks_ms)}에 마지막으로 기록한 가격입니다. 익절은 봇이 판단해 시장가로 하므로 익절 주문이 따로 없습니다.` : "";
   fillRows("symbols", d.by_symbol.map((r) => row([[sym(r.symbol)], [signed(r.pnl), 1], [r.closes, 1], [r.wins, 1]])), "아직 체결 기록이 없습니다.", 4);
   fillRows("fills", d.recent_fills.map((f) => row([[when(f.time_ms)], [sym(f.symbol)], [f.is_close ? "청산" : "진입"], [REASONS[f.reason] || f.reason || ""], [price(f.price), 1], [price(f.amount), 1], [f.is_close ? signed(f.realized - f.fee) : "", 1], [money(f.fee, 4), 1]])), "아직 체결 기록이 없습니다.", 8);
   drawChart();

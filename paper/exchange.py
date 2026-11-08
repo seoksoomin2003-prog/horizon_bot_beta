@@ -26,6 +26,7 @@ from typing import Any, Callable, Optional
 
 import ccxt
 
+from paper.settings import liquidation_price
 from utils.persistence import atomic_write_json, get_absolute_path
 
 STOP_TYPES = {"STOP_MARKET", "STOP"}
@@ -34,7 +35,6 @@ MINUTE_MS = 60_000
 MAX_REPLAY_BARS = 1000
 RECENT_LIMIT = 500
 AMOUNT_DECIMALS = 10
-MAINTENANCE_RATE = 0.005
 
 
 class PaperBlocked(AttributeError):
@@ -73,6 +73,9 @@ class PaperBroker:
                 "settings": {"market": self.market, "leverage": self.leverage, "fee": self.fee, "min_order": self.min_order}}
 
     def _save(self) -> None:
+        # Last seen prices of open positions, so the dashboard can value them without a network connection.
+        self.state["marks"] = {s: self._marks[s] for s in self.state["positions"] if s in self._marks}
+        self.state["marks_ms"] = self._now_ms()
         atomic_write_json(self.state_path, self.state)
 
     def _next_id(self, prefix: str) -> str:
@@ -214,10 +217,7 @@ class PaperBroker:
         self._finish(order, "closed")
 
     def liquidation_price(self, pos: dict) -> float:
-        lev = self.leverage
-        if pos["side"] == "LONG":
-            return pos["entry"] * (1 - 1 / lev + MAINTENANCE_RATE)
-        return pos["entry"] * (1 + 1 / lev - MAINTENANCE_RATE)
+        return liquidation_price(pos["side"], pos["entry"], self.leverage)
 
     def _liquidate(self, symbol: str, pos: dict, now_ms: int) -> None:
         bankrupt = pos["entry"] * (1 - 1 / self.leverage if pos["side"] == "LONG" else 1 + 1 / self.leverage)

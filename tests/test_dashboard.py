@@ -255,3 +255,27 @@ def test_bot_status_reads_pid_and_flags_stale_records(root):
     assert build_summary(root, now=mtime + 1000)["bot"]["stale"] is True
     (run / "bot.pid").write_text("99999999")
     assert build_summary(root)["bot"]["running"] is False
+
+
+def test_positions_are_valued_at_the_last_recorded_price(root):
+    path = root / "runtime/paper_binance/paper_broker.json"
+    state = json.loads(path.read_text())
+    state.update({"settings": {"market": "futures", "leverage": 10, "fee": 0.0005, "min_order": True},
+                  "marks": {"AAA/USDT": 12.0}, "marks_ms": 7000})
+    path.write_text(json.dumps(state))
+    s = build_summary(root)
+    p = s["positions"][0]
+    assert p["mark"] == 12.0 and p["unrealized"] == pytest.approx(2.0)
+    assert p["liquidation"] == pytest.approx(10.0 * (1 - 0.1 + 0.005))
+    assert s["equity"] == pytest.approx(1000.9 + 2.0) and s["marks_ms"] == 7000
+
+
+def test_spot_or_unknown_settings_show_no_liquidation_price(root):
+    assert build_summary(root)["positions"][0]["liquidation"] is None
+    assert build_summary(root)["positions"][0]["unrealized"] is None
+
+
+def test_past_runs_list_archived_records(root):
+    archive_records(root, now=0)
+    runs = build_summary(root)["past_runs"]
+    assert len(runs) == 1 and runs[0]["initial"] == 1000.0 and runs[0]["closes"] == 1 and runs[0]["open_positions"] == 1

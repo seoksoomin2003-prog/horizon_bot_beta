@@ -16,6 +16,13 @@ FEES = {"futures": 0.0005, "spot": 0.001}
 MAX_LEVERAGE = 20
 MIN_INITIAL, MAX_INITIAL = 10.0, 1_000_000.0
 DEFAULTS = {"market": "futures", "leverage": 3, "initial": 50.0, "min_order": True}
+MAINTENANCE_RATE = 0.005    # isolated-margin approximation of Binance's lowest tier
+
+
+def liquidation_price(side: str, entry: float, leverage: float) -> float:
+    if side == "LONG":
+        return entry * (1 - 1 / leverage + MAINTENANCE_RATE)
+    return entry * (1 + 1 / leverage - MAINTENANCE_RATE)
 
 
 def path(runtime_dir: os.PathLike | str) -> Path:
