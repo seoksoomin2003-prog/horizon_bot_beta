@@ -23,6 +23,8 @@ def utc_ms(text: str) -> int:
 WARMUP_START_MS = utc_ms("2020-09-01")
 DEV_START_MS = utc_ms("2021-01-01")
 DEV_END_MS = utc_ms("2025-11-06")
+VAL_END_MS = utc_ms("2026-08-06")
+VAL_DIR = DATA_DIR / "validation"
 
 
 def _guard(end_ms: int) -> None:
@@ -44,16 +46,20 @@ def _pages(fetch, since: int, until: int) -> list:
 
 def download(symbols: list[str] = SYMBOLS, data_dir: Path = DATA_DIR, end_ms: int = DEV_END_MS) -> None:
     _guard(end_ms)
+    _download(symbols, data_dir, WARMUP_START_MS, end_ms)
+
+
+def _download(symbols: list[str], data_dir: Path, start_ms: int, end_ms: int) -> None:
     from replay.market_data import _keyless_client, _market
     data_dir.mkdir(parents=True, exist_ok=True)
     client = _keyless_client()
     client.load_markets()
     for symbol in symbols:
         market = _market(symbol)
-        bars = _pages(lambda c: client.fetch_ohlcv(market, "4h", since=c, limit=1500), WARMUP_START_MS, end_ms)
+        bars = _pages(lambda c: client.fetch_ohlcv(market, "4h", since=c, limit=1500), start_ms, end_ms)
         funding = _pages(lambda c: [[int(p["timestamp"]), float(p["fundingRate"])]
                                     for p in client.fetch_funding_rate_history(market, since=c, limit=1000)],
-                         WARMUP_START_MS, end_ms)
+                         start_ms, end_ms)
         bars = np.array(bars, dtype=float)
         bars = bars[np.unique(bars[:, 0], return_index=True)[1]]
         funding = np.array(funding, dtype=float).reshape(-1, 2)
@@ -68,3 +74,16 @@ def load(symbol: str, end_ms: int = DEV_END_MS, data_dir: Path = DATA_DIR) -> tu
     bars = np.load(data_dir / f"{symbol}.bars.npy")
     funding = np.load(data_dir / f"{symbol}.funding.npy")
     return bars[bars[:, 0] < end_ms], funding[funding[:, 0] < end_ms]
+
+
+def download_validation() -> None:
+    """Validation-period bars only, into their own folder. Spends the validation period (direction v4, approved 2026-11-08)."""
+    _download(SYMBOLS, VAL_DIR, DEV_END_MS, VAL_END_MS)
+
+
+def load_validation(symbol: str) -> tuple[np.ndarray, np.ndarray]:
+    """Development data with the validation period appended, up to VAL_END_MS."""
+    dev_bars, dev_funding = load(symbol)
+    bars, funding = np.load(VAL_DIR / f"{symbol}.bars.npy"), np.load(VAL_DIR / f"{symbol}.funding.npy")
+    bars, funding = np.vstack([dev_bars, bars]), np.vstack([dev_funding, funding])
+    return bars[bars[:, 0] < VAL_END_MS], funding[funding[:, 0] < VAL_END_MS]
