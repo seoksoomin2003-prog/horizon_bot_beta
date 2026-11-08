@@ -15,6 +15,8 @@ from utils.schemas import PositionSchema, PerformanceTrade, EquityState
 from conviction_engine import ConvictionScore
 from utils.safe_ops import safe_div
 
+RISK_SCALE = 0.25    # share of RISK_PER_TRADE actually risked per trade (see validate_trade)
+
 @dataclass
 class FirmOrderRequest:
     symbol: str
@@ -78,7 +80,6 @@ class RiskEngine:
             current_equity=current_equity,
             active_positions=active_positions,
             atr=atr,
-            confidence=conviction.composite_score, # Use composite conviction
             price=last_price,
             side=conviction.side,
             stop_loss=stop_loss_price,
@@ -286,7 +287,6 @@ class RiskEngine:
                         current_equity: float,
                         active_positions: List[PositionSchema],
                         atr: float,
-                        confidence: float = 0.5,
                         **kwargs) -> Dict[str, Any]:
         """
         Validates the trade and returns risk parameters.
@@ -370,12 +370,11 @@ class RiskEngine:
     
             risk_amount = safe_equity * RISK_PER_TRADE
             
-            # [PHASE 9] CONVICTION -> SOFT WEIGHT
-            confidence = max(1.0, float(confidence))
-            confidence_multiplier = confidence / 4.0
-            
+            # Conviction does not scale size. composite_score is 0..1, so the old max(1.0, score) / 4 was always 0.25.
+            # Replay 2026-08-06~11-06 (2318 trades): no score level made money before fees, and sizing by score
+            # would have lost -426 instead of -285 USDT. Keep the fixed quarter until a rule shows a real edge.
             micro = float(kwargs.get('micro_score', 1.0))
-            final_risk_amount = risk_amount * confidence_multiplier * self.performance_multiplier * micro
+            final_risk_amount = risk_amount * RISK_SCALE * self.performance_multiplier * micro
             
             # distance from adjusted entry to stop (with ATR-compression protection floor)
             stop_price = kwargs.get('stop_loss', 0.0)
@@ -417,7 +416,7 @@ class RiskEngine:
             return {
                 'approved': True,
                 'position_size': position_size,
-                'risk_pct': RISK_PER_TRADE * confidence_multiplier * self.performance_multiplier,
+                'risk_pct': RISK_PER_TRADE * RISK_SCALE * self.performance_multiplier,
                 'reason': (
                     f'Approved (StopDistRaw: {stop_distance_raw:.6f}, StopDistUsed: {stop_distance:.6f}, '
                     f'Notional: {position_notional:.2f}, Lev: {effective_leverage:.2f}x)'
