@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>가상 매매 현황</title>
 <style nonce="__NONCE__">
+.kpis.spaced, h2.spaced { margin-top: 16px; }
 :root {
   color-scheme: light;
   --bg: #f5f4f1; --surface: #fcfcfb; --line: #e4e3de; --axis: #c3c2b7;
@@ -81,8 +82,36 @@ button:disabled { opacity: .5; cursor: default; }
     <h1>가상 매매 현황</h1>
     <div class="status" role="status"><span id="dot" class="dot"></span><span id="status">불러오는 중</span></div>
   </header>
-  <div class="notice">실제 돈이 아닌 가상 매매입니다. 이 화면에서는 가상 매매만 켜고 끌 수 있고, 실거래는 켤 수 없습니다.</div>
+  <div class="notice">실제 돈이 아닌 가상 매매입니다. 이 화면에서는 가상 매매와 예측 기록(주문 없음)만 켜고 끌 수 있고, 실거래는 켤 수 없습니다.</div>
   <div id="alert" class="notice alert" hidden></div>
+
+  <section class="card" aria-label="방향 예측 기록">
+    <h2>방향 예측 기록 <span class="label">주문 없음 · 4시간봉 마감마다 다음 4시간 방향을 기록하고 4시간 뒤 채점</span></h2>
+    <p class="current" id="predstatus">불러오는 중</p>
+    <div class="buttons">
+      <button id="predstart" type="button">예측 기록 켜기</button>
+      <button id="predstop" type="button">끄기</button>
+    </div>
+    <div class="message label" id="predmessage" role="status"></div>
+    <dl class="kpis spaced">
+      <div><dt>채점된 예측</dt><dd id="predscored">-</dd></div>
+      <div><dt>모델 적중률</dt><dd id="predhit">-</dd></div>
+      <div><dt>"항상 오른다" 적중률</dt><dd id="predup">-</dd></div>
+      <div><dt>강한 신호 적중률</dt><dd id="predsig">-</dd></div>
+      <div><dt>강한 신호 평균 손익 (비용 0.2% 차감)</dt><dd id="predsignet">-</dd></div>
+    </dl>
+    <p class="label" id="prednote"></p>
+    <h2 class="spaced">최근 예측 <span class="label" id="predlatest"></span></h2>
+    <div class="scroll"><table>
+      <thead><tr><th>코인</th><th class="num">가격</th><th class="num">상승 확률</th><th>예측</th><th class="num">예상 이익</th><th>강한 신호</th></tr></thead>
+      <tbody id="predrows"></tbody>
+    </table></div>
+    <h2 class="spaced">채점 기록 <span class="label">최근 60건</span></h2>
+    <div class="scroll"><table>
+      <thead><tr><th>마감 시각</th><th>코인</th><th class="num">상승 확률</th><th>예측</th><th>실제</th><th class="num">4시간 뒤 가격</th><th>적중</th></tr></thead>
+      <tbody id="predscoredrows"></tbody>
+    </table></div>
+  </section>
 
   <section class="card" aria-label="가상 매매 실행">
     <h2>가상 매매 실행 <span class="label">전략: 봇의 현재 15분봉 규칙 (검증된 수익 근거 없음)</span></h2>
@@ -233,6 +262,49 @@ $("startnew").addEventListener("click", () => {
   send("start_new", s);
 });
 $("stop").addEventListener("click", () => send("stop"));
+async function sendPredictor(action) {
+  for (const id of ["predstart", "predstop"]) $(id).disabled = true;
+  $("predmessage").textContent = "처리 중입니다.";
+  try {
+    const res = await fetch("/api/control", { method: "POST", headers: { "Content-Type": "application/json", "X-Control-Token": TOKEN },
+      body: JSON.stringify({ action }) });
+    const out = await res.json().catch(() => ({ ok: false, message: `요청 실패 (${res.status})` }));
+    $("predmessage").textContent = out.message;
+    $("predmessage").className = "message label" + (out.ok ? "" : " bad");
+  } catch (err) {
+    $("predmessage").textContent = "화면 서버와 연결하지 못했습니다.";
+  } finally {
+    await refresh();
+  }
+}
+$("predstart").addEventListener("click", () => sendPredictor("predictor_start"));
+$("predstop").addEventListener("click", () => sendPredictor("predictor_stop"));
+const ratio = (k, n) => n ? `${pct(k / n, 1)} (${k}/${n})` : "없음";
+const dirText = (p) => p > 0.5 ? "오름" : "내림";
+function renderPredictions(q) {
+  if (!q) return;
+  let text = q.running ? "켜져 있음" : "꺼져 있음";
+  if (q.stale) text = "켜져 있지만 4시간 넘게 갱신 없음 (맥북이 잠들었을 수 있음)";
+  if (q.updated_ms) text += ` · 마지막 확인 ${when(q.updated_ms)}`;
+  if (q.ok === false) text += ` · 오류: ${q.message}`;
+  if (q.first_ms) text += ` · ${when(q.first_ms)}부터 기록`;
+  $("predstatus").textContent = text;
+  $("predstart").disabled = q.running;
+  $("predstop").disabled = !q.running;
+  $("predscored").textContent = `${q.scored}건`;
+  $("predhit").textContent = ratio(q.hits, q.scored);
+  $("predup").textContent = ratio(q.ups, q.scored);
+  $("predsig").textContent = ratio(q.signal_hits, q.signals);
+  $("predsignet").textContent = q.signal_net == null ? "없음" : (q.signal_net > 0 ? "+" : "") + pct(q.signal_net);
+  const margin = q.scored ? 1.96 * Math.sqrt(0.25 / q.scored) : null;
+  $("prednote").textContent = (margin == null ? "아직 채점된 예측이 없습니다. " : `지금 표본으로는 적중률이 우연만으로도 약 ±${(margin * 100).toFixed(1)}%p 흔들립니다. `)
+    + "연구에서 이 모델의 적중률은 약 52%였고, 검증 구간에서는 우위가 확인되지 않았습니다. 강한 신호는 예상 이익이 0.5%를 넘는 경우로 드물게 나옵니다.";
+  $("predlatest").textContent = q.latest.length ? `${when(q.latest[0].close_ms)} 마감 기준` : "";
+  fillRows("predrows", q.latest.map((r) => row([[sym(r.symbol)], [price(r.price), 1], [pct(r.p_up, 1), 1], [dirText(r.p_up)],
+    [pct(r.expected_gain), 1], [r.signal ? "예" : ""]])), "아직 예측이 없습니다. 켜면 다음 4시간봉 마감(한국 시각 1·5·9·13·17·21시) 때 나옵니다.", 6);
+  fillRows("predscoredrows", q.recent.map((r) => row([[when(r.close_ms)], [sym(r.symbol)], [pct(r.p_up, 1), 1], [dirText(r.p_up)],
+    [r.up ? "오름" : "내림"], [price(r.next_price), 1], [r.hit ? "맞음" : "틀림"]])), "아직 채점된 예측이 없습니다.", 7);
+}
 $("resume").addEventListener("click", () => send("resume"));
 
 function row(cells) {
@@ -354,6 +426,7 @@ function drawChart() {
 
 function render(d) {
   lastData = d;
+  renderPredictions(d.predictions);
   const b = d.bot;
   let cls = "good", text = "봇 실행 중";
   if (!b.running) { cls = "critical"; text = "봇 중지됨"; }

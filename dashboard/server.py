@@ -5,8 +5,9 @@ Standard library only, and it imports nothing from the bot except paper/settings
 the bot's config module loads .env, and this process must never have keys in memory. It listens on the loopback
 address only and makes no outbound connection.
 
-The one write route starts or stops paper trading through run_mac.sh. It can never start live trading: run_mac.sh
-needs --live and a typed phrase for that, and this server passes neither. A control request must come from this page
+The one write route starts or stops paper trading through run_mac.sh, or the direction predictor through
+run_predictor.sh (which places no orders). It can never start live trading: run_mac.sh needs --live and a typed phrase
+for that, and this server passes neither. A control request must come from this page
 (same origin and a per-start token), so another website open in the browser cannot send one.
 """
 
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -42,6 +44,10 @@ MAX_BODY = 4096
 CONTROL_TIMEOUT = 60
 LOG_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ - \S+ - ([A-Z]+) - (.*)$")
 SECRET_LIKE = re.compile(r"[A-Za-z0-9_\-+/=]{32,}")
+BAR_MS = 4 * 3_600_000
+PREDICTOR_STALE_MS = BAR_MS + 20 * 60_000
+ROUND_TRIP_COST = 0.002     # the research cost: 0.10% per side
+MAX_PREDICTION_ROWS = 60
 
 
 def mask(text: str) -> str:
@@ -129,7 +135,7 @@ def build_summary(root: Path, cache: Optional[dict] = None, now: Optional[float]
               "settings": paper_settings.load(root / "runtime"), "run_settings": (state or {}).get("settings"),
               "limits": {"max_leverage": paper_settings.MAX_LEVERAGE, "min_initial": paper_settings.MIN_INITIAL,
                          "fees": paper_settings.FEES},
-              "past_runs": past_runs(root)}
+              "past_runs": past_runs(root), "predictions": prediction_summary(root, now * 1000)}
     log_dir = root / "logs" / "paper"
     errors = log_entries(log_dir / "errors.log")
     result["error_count_recent"] = len(errors)
@@ -205,11 +211,57 @@ def past_runs(root: Path, limit: int = 20) -> list[dict]:
     return rows[:limit]
 
 
-def run_script(root: Path, *args: str) -> tuple[bool, str]:
+def pid_alive(path: Path) -> bool:
+    try:
+        os.kill(int(path.read_text().strip()), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def prediction_summary(root: Path, now_ms: float) -> dict:
+    """The live direction predictor's record (predictor/live.py), scored against what happened next."""
+    folder = root / "runtime" / "predictor"
+    predicted = read_ledger(folder / "predictions.jsonl")
+    outcomes = {(o.get("symbol"), o.get("close_ms")): o for o in read_ledger(folder / "outcomes.jsonl")}
+    try:
+        status = json.loads((folder / "status.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        status = {}
+    running = pid_alive(root / ".run" / "predictor.pid")
+    updated = status.get("updated_ms")
+    rows, scored, signals = [], [], []
+    for p in predicted:
+        o = outcomes.get((p.get("symbol"), p.get("close_ms")))
+        row = {"close_ms": p.get("close_ms"), "symbol": p.get("symbol"), "price": p.get("price"), "p_up": p.get("p_up"),
+               "expected_gain": p.get("expected_gain"), "signal": bool(p.get("signal")), "next_price": None, "up": None, "hit": None}
+        if o is not None:
+            up = o["log_return"] > 0
+            row.update(next_price=o.get("next_price"), up=up, hit=(p["p_up"] > 0.5) == up)
+            scored.append((row, o["log_return"]))
+            if row["signal"]:
+                signals.append((row, o["log_return"]))
+        rows.append(row)
+    latest_close = max((r["close_ms"] for r in rows), default=None)
+    n = len(scored)
+    net = [(1 if r["p_up"] > 0.5 else -1) * (math.exp(ret) - 1) - ROUND_TRIP_COST for r, ret in signals]
+    return {
+        "running": running, "stale": bool(running and updated and now_ms - updated > PREDICTOR_STALE_MS),
+        "updated_ms": updated, "ok": status.get("ok"), "message": mask(str(status.get("message", "")))[:200],
+        "model_month": status.get("model_month"), "first_ms": rows[0]["close_ms"] if rows else None,
+        "latest": sorted((r for r in rows if r["close_ms"] == latest_close), key=lambda r: -abs(r["p_up"] - 0.5)),
+        "scored": n, "hits": sum(r["hit"] for r, _ in scored), "ups": sum(r["up"] for r, _ in scored),
+        "signals": len(signals), "signal_hits": sum(r["hit"] for r, _ in signals),
+        "signal_net": sum(net) / len(net) if net else None,
+        "recent": [r for r in rows if r["hit"] is not None][::-1][:MAX_PREDICTION_ROWS],
+    }
+
+
+def run_script(root: Path, *args: str, script: str = "run_mac.sh") -> tuple[bool, str]:
     """Runs run_mac.sh without any live-trading variable, so only paper mode can start."""
     env = {k: v for k, v in os.environ.items() if k not in ("TRADING_MODE", "LIVE_TRADING_CONFIRM")}
     try:
-        done = subprocess.run([str(root / "run_mac.sh"), *args], cwd=root, env=env, stdin=subprocess.DEVNULL,
+        done = subprocess.run([str(root / script), *args], cwd=root, env=env, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=CONTROL_TIMEOUT)
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, str(e)
@@ -237,7 +289,27 @@ def is_running(root: Path) -> bool:
     return bot_status(root, None, time.time())["running"]
 
 
+def predictor_control(root: Path, action: str, runner=run_script) -> tuple[int, dict]:
+    """Starts or stops the direction predictor, which places no orders."""
+    running = pid_alive(root / ".run" / "predictor.pid")
+    if action == "predictor_start":
+        if running:
+            return 200, {"ok": True, "message": "예측 기록기가 이미 켜져 있습니다."}
+        ok, out = runner(root, "start", script="run_predictor.sh")
+        return (200, {"ok": True, "message": "예측 기록기를 켰습니다. 처음에는 과거 시세를 받느라 1~2분 걸리고, 첫 예측은 다음 4시간봉 마감 때 나옵니다."}) \
+            if ok else (500, {"ok": False, "message": f"켜지 못했습니다. {out}"})
+    if action == "predictor_stop":
+        if not running:
+            return 200, {"ok": True, "message": "예측 기록기가 이미 꺼져 있습니다."}
+        ok, out = runner(root, "stop", script="run_predictor.sh")
+        return (200, {"ok": True, "message": "예측 기록기를 껐습니다. 기록은 남아 있습니다."}) if ok else \
+               (500, {"ok": False, "message": f"끄지 못했습니다. {out}"})
+    return 400, {"ok": False, "message": "알 수 없는 요청입니다."}
+
+
 def control(root: Path, action: str, raw_settings: Optional[dict] = None, runner=run_script) -> tuple[int, dict]:
+    if action in ("predictor_start", "predictor_stop"):
+        return predictor_control(root, action, runner)
     if action == "stop":
         if not is_running(root):
             return 200, {"ok": True, "message": "이미 중지되어 있습니다."}

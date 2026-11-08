@@ -19,3 +19,4 @@ runtime/paper_settings.json
 
 # Historical replay data and runs
 replay_data/
+runtime/predictor/
