@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import Optional
 
 @dataclass(frozen=True)
 class Ticker:

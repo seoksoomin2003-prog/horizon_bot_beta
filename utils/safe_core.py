@@ -1,7 +1,6 @@
 import pandas as pd
-import numpy as np
 from typing import Any, List, Dict, Optional
-from utils.exceptions import ZeroDivisionGuard, DataIntegrityError
+from utils.exceptions import ZeroDivisionGuard
 
 class SafeCore:
     @staticmethod

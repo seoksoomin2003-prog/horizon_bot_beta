@@ -31,10 +31,6 @@ class RuntimeCoordinator:
         with self.state_lock:
             self.state[key] = value
 
-    def update_state(self, updates: Dict[str, Any]):
-        with self.state_lock:
-            self.state.update(updates)
-
     def is_running(self) -> bool:
         return self.get_state("is_running", False)
 

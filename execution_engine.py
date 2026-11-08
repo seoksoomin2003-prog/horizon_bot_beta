@@ -15,11 +15,9 @@ import config
 from logger import trades_logger, errors_logger
 from utils.safe_core import SafeCore
 from utils.telegram_commands import send_message
-from utils.schemas import PositionSchema, TradeSignal, Ticker, AccountState, PerformanceTrade
-from typing import List, Dict, Any, Optional
-from utils.validator import Validator
+from utils.schemas import PositionSchema, TradeSignal
+from typing import Dict, Optional
 from utils.exceptions import ExecutionFailure, DataIntegrityError
-from utils.safe_ops import safe_float
 
 from risk_engine import FirmOrderRequest
 from utils.retry_scheduler import BoundedRetryScheduler
@@ -189,7 +187,6 @@ class ExecutionEngine:
             atomic_write_json(self.registry_file, self.order_registry)
         except Exception as e:
             errors_logger.critical(f"FATAL: Failed to save order registry: {e}. HALTING BOT.")
-            import config
             from utils.runtime_coordinator import RuntimeCoordinator
             RuntimeCoordinator().set_state("is_running", False)
             raise e
@@ -200,7 +197,6 @@ class ExecutionEngine:
             atomic_write_json(self.pending_sl_file, self.pending_sl)
         except Exception as e:
             errors_logger.critical(f"FATAL: Failed to save pending SL registry: {e}. HALTING BOT.")
-            import config
             from utils.runtime_coordinator import RuntimeCoordinator
             RuntimeCoordinator().set_state("is_running", False)
             raise e
@@ -569,7 +565,6 @@ class ExecutionEngine:
             self._save_order_registry()
         
         if not intent_id:
-            import uuid
             intent_id = uuid.uuid4().hex
             
         order_uid = generate_order_uid(symbol, order_side, intent_id)
@@ -976,7 +971,6 @@ class ExecutionEngine:
 
     def confirm_trade_execution(self, symbol, order_id):
         """Fallback verification for market orders."""
-        from utils.safe_core import SafeCore
         try:
             trades = self.dh.exchange.fetch_my_trades(self.dh.format_symbol(symbol), limit=5)
             matched = [t for t in trades if str(t.get('order')) == str(order_id)]
@@ -1043,10 +1037,6 @@ class ExecutionEngine:
             errors_logger.error(f"atomic_stop_update failed for {symbol}: {e}")
             return False
 
-    def modify_stop_loss(self, symbol, pos):
-        """atomic stop update wrapper."""
-        return self.atomic_stop_update(symbol, pos, pos.stop_loss)
-
     def _position_already_closed(self, symbol) -> bool:
         """True only when the exchange answers and has no such position. If it cannot answer, recovery goes ahead."""
         try:
@@ -1059,7 +1049,6 @@ class ExecutionEngine:
         [WATCHDOG] Periodically verifies all active positions have an SL on exchange.
         UNIVERSAL INPUT HANDLER (CRITICAL FIX)
         """
-        import config
         from utils.runtime_coordinator import RuntimeCoordinator
         if not RuntimeCoordinator().get_state("is_running", True):
             return True
@@ -1097,7 +1086,6 @@ class ExecutionEngine:
                     all_ok = False
                     self.watchdog_all_ok = False
                 # If existing SL is found, we do not reset all_ok back to True.
-                pass
             except Exception as e:
                 errors_logger.error(f"[WATCHDOG] Failure auditing {symbol}: {e}")
                 all_ok = False

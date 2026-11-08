@@ -76,5 +76,4 @@ class BitgetAdapter(AbstractExchangeAdapter):
                     errors_logger.warning(f"Could not enforce {mode_text} mode for {symbol}: {e}")
 
     def generate_client_order_id(self) -> Optional[str]:
-        import uuid
         return str(uuid.uuid4()).replace('-', '')[:30]

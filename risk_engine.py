@@ -11,9 +11,9 @@ from dataclasses import dataclass
 from logger import trades_logger, errors_logger
 from utils.safe_core import SafeCore
 from utils.validator import Validator
-from utils.schemas import PositionSchema, AccountState, PerformanceTrade, EquityState
+from utils.schemas import PositionSchema, PerformanceTrade, EquityState
 from conviction_engine import ConvictionScore
-from utils.safe_ops import safe_float, safe_div
+from utils.safe_ops import safe_div
 
 @dataclass
 class FirmOrderRequest:
@@ -119,7 +119,6 @@ class RiskEngine:
         """
         Loads and NORMALIZES persistent performance data.
         """
-        import os, json
         from config import SYMBOLS_PERFORMANCE_STATE
         from utils.persistence import get_absolute_path
         abs_state_path = get_absolute_path(SYMBOLS_PERFORMANCE_STATE)
@@ -147,7 +146,6 @@ class RiskEngine:
         """
         Saves institutional performance metrics.
         """
-        import os
         from config import SYMBOLS_PERFORMANCE_STATE
         from utils.persistence import get_absolute_path, atomic_write_json
         abs_state_path = get_absolute_path(SYMBOLS_PERFORMANCE_STATE)

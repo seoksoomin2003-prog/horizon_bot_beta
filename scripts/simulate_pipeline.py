@@ -13,7 +13,6 @@ from execution_engine import ExecutionEngine
 from utils.exit_engine import ExitEngine
 from state_engine import StateEngine
 from pipeline import Pipeline
-from logger import trades_logger
 import config
 
 def run_simulation():

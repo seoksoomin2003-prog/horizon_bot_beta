@@ -10,7 +10,7 @@ import numpy as np
 from ta.momentum import RSIIndicator
 from ta.trend import ADXIndicator, EMAIndicator
 from ta.volatility import AverageTrueRange
-from config import REGIME_ADX_THRESHOLD, REGIME_ATR_PCT_THRESHOLD, N_PERIOD_BREAKOUT, RSI_OVERSOLD, RSI_OVERBOUGHT
+from config import REGIME_ADX_THRESHOLD, REGIME_ATR_PCT_THRESHOLD, N_PERIOD_BREAKOUT
 from utils.safe_core import SafeCore
 from utils.schemas import TradeSignal
 from logger import trades_logger

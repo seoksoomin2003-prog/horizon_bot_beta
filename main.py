@@ -20,7 +20,6 @@ from execution_engine import ExecutionEngine
 from state_engine import StateEngine
 from pipeline import Pipeline
 from utils.exit_engine import ExitEngine
-from utils.invariants_v2 import InvariantsV2
 
 def check_trading_mode():
     """Refuses unsafe live starts before any connection or state is opened."""

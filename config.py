@@ -12,15 +12,6 @@ def safe_config(name: str, default=None):
     """
     return os.getenv(name, default)
 
-def set_runtime_telegram_enabled(enabled: bool):
-    """
-    Runtime flag used after environment validation.
-    This lets every module share the same Telegram safe-mode state.
-    """
-    normalized = bool(enabled)
-    Config.TELEGRAM_ENABLED = normalized
-    globals()["TELEGRAM_ENABLED"] = normalized
-
 # --- TRADING MODE: paper unless TRADING_MODE=live is set explicitly ---
 LIVE_CONFIRM_PHRASE = "I_ACCEPT_REAL_LOSSES"
 IS_LIVE = os.getenv("TRADING_MODE", "paper").strip().lower() == "live"
@@ -129,7 +120,6 @@ class Config:
     SUPPORTED_TIMEFRAMES = ["1m", "5m", "15m", "1h"]
 
     # 4. Strategy Thresholds (v4 Transformation)
-    BASE_RISK_PER_TRADE = 0.0075    # 0.75% base risk
     MAX_DRAWDOWN_THRESHOLD = 0.10   # 10% hard stop
     MAX_DRAWDOWN_REDUCTION = 0.05   # 5% drawdown -> Reduce risk by 50%
     SHARPE_LOOKBACK = 20            # trades for rolling metrics
@@ -143,12 +133,8 @@ class Config:
     REGIME_ADX_THRESHOLD = 25
     REGIME_ATR_PCT_THRESHOLD = 20
     N_PERIOD_BREAKOUT = 20
-    RSI_OVERSOLD = 30
-    RSI_OVERBOUGHT = 70
 
     # Trading Excellence
-    MAX_SPREAD_PCT = 0.0015         # Max bid-ask spread allowed (0.15%)
-    SIGNAL_SCORE_THRESHOLD = 2     # Minimum confluence score required
     MAX_TRADES_PER_HOUR = 3        # Max trades per symbol per hour
     SYMBOLS_PERFORMANCE_STATE = "state/performance.json"
 
@@ -180,7 +166,6 @@ MAX_EQUITY_DROP_PCT = Config.MAX_EQUITY_DROP_PCT
 EQUITY_MONITOR_WINDOW_MIN = Config.EQUITY_MONITOR_WINDOW_MIN
 MAX_CONSECUTIVE_SYSTEM_FAILURES = Config.MAX_CONSECUTIVE_SYSTEM_FAILURES
 POSITION_MODE = Config.POSITION_MODE
-BASE_RISK_PER_TRADE = Config.BASE_RISK_PER_TRADE
 MAX_DRAWDOWN_THRESHOLD = Config.MAX_DRAWDOWN_THRESHOLD
 MAX_DRAWDOWN_REDUCTION = Config.MAX_DRAWDOWN_REDUCTION
 SHARPE_LOOKBACK = Config.SHARPE_LOOKBACK
@@ -188,10 +173,6 @@ REGIME_MULTIPLIERS = Config.REGIME_MULTIPLIERS
 REGIME_ADX_THRESHOLD = Config.REGIME_ADX_THRESHOLD
 REGIME_ATR_PCT_THRESHOLD = Config.REGIME_ATR_PCT_THRESHOLD
 N_PERIOD_BREAKOUT = Config.N_PERIOD_BREAKOUT
-RSI_OVERSOLD = Config.RSI_OVERSOLD
-RSI_OVERBOUGHT = Config.RSI_OVERBOUGHT
-MAX_SPREAD_PCT = Config.MAX_SPREAD_PCT
-SIGNAL_SCORE_THRESHOLD = Config.SIGNAL_SCORE_THRESHOLD
 MAX_TRADES_PER_HOUR = Config.MAX_TRADES_PER_HOUR
 SYMBOLS_PERFORMANCE_STATE = Config.SYMBOLS_PERFORMANCE_STATE
 MAX_SLIPPAGE_PCT = Config.MAX_SLIPPAGE_PCT

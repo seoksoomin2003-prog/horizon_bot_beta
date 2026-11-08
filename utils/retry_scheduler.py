@@ -1,8 +1,7 @@
 import time
-import logging
 import threading
 import uuid
-from typing import Dict, Any, Optional, Tuple
+from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 from logger import trades_logger, errors_logger
 
@@ -37,21 +36,6 @@ class TaskLease:
         if lease_id:
             if TaskAbandonRegistry.is_abandoned(lease_id):
                 raise RuntimeError(f"Task lease {lease_id} has been revoked/abandoned. Aborting execution.")
-            TaskHeartbeat.record_heartbeat(lease_id)
-
-class TaskHeartbeat:
-    _lock = threading.Lock()
-    _heartbeats = {}
-
-    @classmethod
-    def record_heartbeat(cls, lease_id: str):
-        with cls._lock:
-            cls._heartbeats[lease_id] = time.time()
-
-    @classmethod
-    def get_last_heartbeat(cls, lease_id: str) -> Optional[float]:
-        with cls._lock:
-            return cls._heartbeats.get(lease_id)
 
 class WorkerGenerationRegistry:
     _lock = threading.Lock()

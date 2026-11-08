@@ -1,6 +1,5 @@
 import pandas as pd
 from typing import List
-import numpy as np
 import ccxt
 import time
 import config
@@ -11,7 +10,6 @@ from utils.safe_core import SafeCore
 from utils.validator import Validator
 from utils.schemas import Ticker, PositionSchema, AccountState
 from utils.exceptions import DataIntegrityError
-from utils.safe_ops import safe_float
 
 class DataHandler:
     def __init__(self):
@@ -134,7 +132,6 @@ class DataHandler:
 
     def validate_api_keys(self):
         """[PHASE 2] API Validation Guard."""
-        import ccxt
         attempt = 0
         max_attempts = 3
         while attempt < max_attempts:
@@ -292,26 +289,6 @@ class DataHandler:
         
         return 0.0, 0.0
 
-    def parse_plan_order_status(self, order):
-        """
-        Bitget V2 custom planStatus parser.
-        [C8] Standard CCXT status can be None for Plan Orders.
-        """
-        try:
-            raw_info = order.get('info', {})
-            # Bitget V2 planStatus: 'not_triggered', 'executing', 'triggered', 'fail', 'cancel'
-            plan_status = raw_info.get('planStatus', '').lower()
-            
-            if plan_status in ['not_triggered', 'live']:
-                return 'open'
-            elif plan_status in ['executing', 'triggered']:
-                return 'closed' # Or 'triggered' depending on needs
-            elif plan_status in ['fail', 'cancel']:
-                return 'canceled'
-            return order.get('status', 'unknown')
-        except:
-            return 'unknown'
-
     def get_account_state(self) -> AccountState:
         """
         Fetch real-time account data as a typed schema.
@@ -328,26 +305,6 @@ class DataHandler:
             DegradedExchangeManager().report_failure(f"Account State fetch failure: {e}")
             from utils.schemas import ACCOUNT_STATE_UNAVAILABLE
             return ACCOUNT_STATE_UNAVAILABLE
-
-    def get_used_margin(self):
-        """[POLICY 1] Institutional Margin Monitoring."""
-        try:
-            balance = self.exchange.fetch_balance()
-            # Bitget V2 Margin used is found in 'used' field of USDT
-            used = safe_float(balance.get('USDT', {}).get('used'), 0.0)
-            self.last_used_margin = used
-            return used
-        except Exception as e:
-            errors_logger.error(f"Error fetching used margin: {e}")
-            return self.last_used_margin
-
-    def sync_time_difference(self):
-        """[C7] Periodic Time Drift Correction."""
-        try:
-            self.exchange.load_time_difference()
-            trades_logger.info(f"[SYNC] Clock drift corrected. Offset: {self.exchange.milliseconds_offset}ms")
-        except Exception as e:
-            errors_logger.error(f"Failed to sync time: {e}")
 
     def get_position_mode(self, symbol=None):
         """

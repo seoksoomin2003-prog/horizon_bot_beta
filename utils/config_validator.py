@@ -1,5 +1,4 @@
 import os
-import json
 import logging
 from typing import Dict, Any
 
@@ -28,7 +27,6 @@ OPTIONAL_ENV = [
 
 # Use ABSOLUTE paths for Windows reliability
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SNAPSHOT_PATH = os.path.join(BASE_DIR, "data", "config_snapshot.json")
 
 def validate_env() -> bool:
     """
@@ -106,33 +104,6 @@ def validate_config_values(config_obj: Any):
         current_tf = getattr(config_obj, "TIMEFRAME", "")
         if current_tf not in supported:
             raise Exception(f"[CONFIG ERROR] Unsupported TIMEFRAME for Bitget: {current_tf}. Must be one of {supported}")
-
-def check_config_drift(config_data: Dict[str, Any]):
-    """
-    PHASE 2: CONFIG DRIFT DETECTION
-    Compares current config against data/config_snapshot.json
-    """
-    if not os.path.exists("data"):
-        os.makedirs("data")
-
-    if not os.path.exists(SNAPSHOT_PATH):
-        # Initial snapshot creation
-        with open(SNAPSHOT_PATH, "w") as f:
-            json.dump(config_data, f, indent=4)
-        print(f"[INFO] Initialized new config snapshot at {SNAPSHOT_PATH}")
-        return
-
-    try:
-        with open(SNAPSHOT_PATH, "r") as f:
-            snapshot = json.load(f)
-        
-        drift = {k: v for k, v in config_data.items() if k in snapshot and snapshot[k] != v}
-        
-        if drift:
-            print(f"[WARNING] CONFIG DRIFT DETECTED: {drift}")
-            # In production recovery, we might log this to a specific audit trail
-    except Exception as e:
-        print(f"[ERROR] Failed to load snapshot: {e}")
 
 def get_config_summary(config_obj: Any) -> Dict[str, Any]:
     """

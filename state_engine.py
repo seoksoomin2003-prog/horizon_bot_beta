@@ -12,7 +12,6 @@ import threading
 import os
 from typing import List, Optional
 from logger import trades_logger, errors_logger
-from utils.validator import Validator
 from utils.schemas import PositionSchema
 from utils.safe_core import SafeCore
 from utils.event_sourced_runtime import OwnershipRegistry, ConcurrencyException, LifecycleEvent
@@ -541,8 +540,6 @@ class StateEngine:
                     owner.submit_event("SL_PLACED", {"price": recovered_price, "order_id": existing_sl.get('id')})
                     return
             
-            import config
-            from utils.runtime_coordinator import RuntimeCoordinator
             df = dh.fetch_ohlcv(symbol, config.TIMEFRAME)
             last = SafeCore.last_row(df)
             current_atr = SafeCore.float(last.get('atr')) if last is not None else 0.0
@@ -579,11 +576,6 @@ class StateEngine:
     def is_position_active(self, symbol):
         return any(p.symbol == symbol for p in self.active_positions)
     
-    def can_trade(self, symbol, cooldown_seconds):
-        with self.lock:
-            last_time = self.last_trade_times.get(symbol, 0)
-            return (int(time.time()) - last_time) >= cooldown_seconds
-
     def is_fallback_mode_active(self) -> bool:
         with self.lock:
             now = int(time.time())

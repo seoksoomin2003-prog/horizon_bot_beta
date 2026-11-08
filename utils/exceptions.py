@@ -6,10 +6,6 @@ class DataIntegrityError(HorizonError):
     """Raised when data from API is missing, None, or logically invalid."""
     pass
 
-class RiskViolationError(HorizonError):
-    """Raised when a trade violates institutional risk parameters."""
-    pass
-
 class ExecutionFailure(HorizonError):
     """Raised when an order placement or cancellation fails terminaly."""
     pass

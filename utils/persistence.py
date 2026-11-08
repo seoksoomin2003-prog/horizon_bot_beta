@@ -103,8 +103,6 @@ class ProcessLock:
         Atomically acquires an exclusive lock on the lock file.
         Returns True if lock was successfully acquired, False otherwise.
         """
-        import os
-        import sys
         
         # Ensure the parent directory exists
         os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
@@ -155,8 +153,6 @@ class ProcessLock:
         """
         Releases the lock and deletes the file only if we own it.
         """
-        import os
-        import sys
         if self.fd is not None:
             own_lock = False
             try:

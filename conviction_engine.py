@@ -5,7 +5,6 @@ Transforms raw signals into weighted Conviction scores.
 CONVICTION STAGE of the Pipeline.
 """
 
-from typing import Dict, Any, Optional
 from dataclasses import dataclass
 from utils.schemas import TradeSignal
 from utils.safe_core import SafeCore
@@ -61,10 +60,3 @@ class ConvictionEngine:
             regime_bias=1.0,
             micro_score=1.0
         )
-
-    def is_convincing(self, conviction: ConvictionScore) -> bool:
-        """
-        Phase 3: Soft gate, never blocks entry based on conviction score alone.
-        Size multiplier handles risk.
-        """
-        return True

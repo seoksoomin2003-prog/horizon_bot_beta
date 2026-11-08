@@ -26,7 +26,6 @@ def safe_print(msg):
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import BITGET_API_KEY, BITGET_API_SECRET, BITGET_PASSPHRASE
-from logger import errors_logger
 
 def diagnose():
     safe_print("[INIT] Starting Bitget API Forensic Diagnosis...")

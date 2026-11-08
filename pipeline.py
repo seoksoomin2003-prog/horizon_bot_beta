@@ -8,16 +8,15 @@ SIGNAL -> CONVICTION -> RISK -> EXECUTION -> EXIT -> STATE_SYNC
 import pandas as pd
 import time
 import threading
-from typing import List, Dict, Any, Optional
 from logger import trades_logger, errors_logger
 from utils.invariants_v2 import InvariantsV2
 from signal_engine import SignalEngine
-from conviction_engine import ConvictionEngine, ConvictionScore
-from risk_engine import RiskEngine, FirmOrderRequest
+from conviction_engine import ConvictionEngine
+from risk_engine import RiskEngine
 from execution_engine import ExecutionEngine
 from utils.exit_engine import ExitEngine, ExitAction
 from state_engine import StateEngine
-from utils.schemas import TradeSignal, PositionSchema
+from utils.schemas import PositionSchema
 from utils.safe_core import SafeCore
 from utils.lifecycle import validate_position_lifecycle
 import config
@@ -227,8 +226,6 @@ class Pipeline:
                     errors_logger.error(f"Failed to execute exit parallel cycle: {ex_run}")
 
             # 3. OPPORTUNITY SCAN (ENTRY STAGE - PARALLEL)
-            import config
-            from utils.runtime_coordinator import RuntimeCoordinator
             if RuntimeCoordinator().get_state('trading_enabled', True) and system_ok and account_verified:
                 symbols_to_scan = [s for s in config.SYMBOLS if not self.state.is_position_active(s)]
                 if symbols_to_scan:
@@ -547,7 +544,6 @@ class Pipeline:
         the lease list, the position list or both, never neither. The position read is slow, so it stays outside
         _worker_lock, which the main cycle needs.
         """
-        import config
         with self._entry_gate_lock:
             with self._worker_lock:
                 sending = {s for s, other in self.active_entry_workers.items() if other.status == LEASE_ORDERING}
@@ -569,8 +565,6 @@ class Pipeline:
             from utils.retry_scheduler import WorkerGenerationRegistry
             WorkerGenerationRegistry.set_thread_generation(symbol, "ENTRY", lease.generation_id)
             WorkerGenerationRegistry.verify_active()
-        import config
-        from utils.runtime_coordinator import RuntimeCoordinator
         from utils.degraded_manager import DegradedExchangeManager
         if not RuntimeCoordinator().get_state("is_running", True) or not DegradedExchangeManager().is_entry_allowed():
             return

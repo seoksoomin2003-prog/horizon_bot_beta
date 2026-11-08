@@ -6,9 +6,9 @@ that must be satisfied before ANY state transition or execution.
 """
 
 import time
-from typing import Dict, Any, Optional
-from logger import trades_logger, errors_logger
-from utils.safe_ops import safe_float, safe_div
+from typing import Dict, Any
+from logger import errors_logger
+from utils.safe_ops import safe_float
 
 class InvariantsV2:
     @staticmethod
@@ -62,11 +62,3 @@ class InvariantsV2:
         
         obi = (bid_vol - ask_vol) / total_vol
         return obi
-
-    @staticmethod
-    def audit_process_lock(lock_path: str) -> bool:
-        """
-        [S1] Process Invariant: Ensure only one instance is active.
-        """
-        import os
-        return os.path.exists(lock_path)

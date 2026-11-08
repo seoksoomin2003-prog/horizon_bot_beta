@@ -1,14 +1,12 @@
 import os
 import json
 import time
-import uuid
 import threading
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field
 from logger import trades_logger, errors_logger
 from utils.schemas import PositionSchema
-from utils.persistence import get_absolute_path, atomic_write_json
-from utils.degraded_manager import DegradedExchangeManager, ExchangeDegradationState
+from utils.persistence import get_absolute_path
 
 @dataclass(frozen=True)
 class LifecycleEvent:

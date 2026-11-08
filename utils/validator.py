@@ -1,4 +1,4 @@
-from typing import Any, List, Dict, Optional
+from typing import Any
 from utils.schemas import Ticker, PositionSchema, AccountState, PerformanceTrade
 from utils.safe_core import SafeCore
 from utils.exceptions import DataIntegrityError
