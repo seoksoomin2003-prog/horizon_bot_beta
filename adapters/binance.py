@@ -2,6 +2,12 @@ from typing import Dict, Any, Optional
 from adapters.base import AbstractExchangeAdapter
 
 class BinanceAdapter(AbstractExchangeAdapter):
+    def format_symbol(self, symbol: str) -> str:
+        # ccxt reads "BTC/USDT" as the spot market even with defaultType future; the USDT-M perpetual is "BTC/USDT:USDT".
+        if ':' not in symbol:
+            return f"{symbol}:USDT"
+        return symbol
+
     def format_order_params(self, symbol: str, side: str, amount: float, price: float, client_order_id: str, reduce_only: bool = False, order_type: str = "limit", params: Dict[str, Any] = None) -> Dict[str, Any]:
         p = params or {}
         if client_order_id:

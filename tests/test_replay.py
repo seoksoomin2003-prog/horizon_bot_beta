@@ -223,7 +223,7 @@ def test_real_pipeline_enters_after_the_signal_and_its_stop_closes(scripted_run)
     fills, bars, start = scripted_run["fills"], scripted_run["bars"], scripted_run["start"]
     assert len(fills) == 2, fills
     entry, stop = fills
-    assert entry["side"] == "buy" and entry["symbol"] == "AAA/USDT"
+    assert entry["side"] == "buy" and entry["symbol"] == "AAA/USDT:USDT"
     assert entry["timestamp"] == bars[start + 3, 0] + MINUTE_MS - 1     # at the end of the signal minute, not before
     assert entry["price"] == pytest.approx(100.0 * 1.0005)
     assert stop["reason"] == "stop" and stop["side"] == "sell"
