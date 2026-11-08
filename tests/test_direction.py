@@ -64,3 +64,32 @@ def test_v4_fixed_threshold_replaces_the_cost_threshold():
     # expected gains: 0.2 * 0.02 * 0.798 = 0.32% and 0.8 * 0.02 * 0.798 = 1.28%
     assert len(trades(pred, 1, 0.001)) == 2
     assert list(trades(pred, 1, 0.002, min_gain=0.005)["p"]) == [0.9]
+
+
+def flow_rows(b, seed=2):
+    rng = np.random.default_rng(seed)
+    vol = rng.uniform(1, 2, len(b))
+    return np.column_stack([b[:, 0], vol, vol * rng.uniform(0.3, 0.7, len(b)), rng.normal(0, 1e-4, len(b))])
+
+
+def test_flow_features_do_not_use_the_future():
+    from research.direction import FLOW_FEATURES
+    b = bars()
+    f = flow_rows(b)
+    changed = f.copy()
+    changed[400:, 2] = changed[400:, 1]          # every later bar becomes all buying
+    changed[400:, 3] = 0.01
+    a, c = frame("X", b, FUNDING, None, 6, f), frame("X", b, FUNDING, None, 6, changed)
+    cols = FEATURES + FLOW_FEATURES
+    assert np.allclose(a.loc[399, cols].to_numpy(float), c.loc[399, cols].to_numpy(float), equal_nan=True)
+    assert not np.isclose(a.loc[400, "taker_1"], c.loc[400, "taker_1"])
+    assert abs(a.loc[399, "taker_1"] - (f[399, 2] / f[399, 1] - 0.5)) < 1e-12
+
+
+def test_final_check_period_is_closed_to_flow_development_code():
+    import pytest
+    from research import h4_data
+    with pytest.raises(PermissionError):
+        h4_data.load_flow("BTCUSDT", end_ms=h4_data.VAL_END_MS + 1)
+    with pytest.raises(PermissionError):
+        h4_data.download_flow(end_ms=h4_data.VAL_END_MS + 1)

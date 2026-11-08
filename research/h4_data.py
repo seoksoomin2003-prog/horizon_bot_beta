@@ -87,3 +87,42 @@ def load_validation(symbol: str) -> tuple[np.ndarray, np.ndarray]:
     bars, funding = np.load(VAL_DIR / f"{symbol}.bars.npy"), np.load(VAL_DIR / f"{symbol}.funding.npy")
     bars, funding = np.vstack([dev_bars, bars]), np.vstack([dev_funding, funding])
     return bars[bars[:, 0] < VAL_END_MS], funding[funding[:, 0] < VAL_END_MS]
+
+
+FLOW_DIR = DATA_DIR / "flow"
+HOLDOUT_END_MS = utc_ms("2026-11-06")     # v5 final check: VAL_END_MS .. HOLDOUT_END_MS, once, with the user's approval
+
+
+def _flow_guard(end_ms: int) -> None:
+    if end_ms > VAL_END_MS:
+        raise PermissionError("the v5 final-check period is closed to development code")
+
+
+def download_flow(symbols: list[str] = SYMBOLS, data_dir: Path = FLOW_DIR, end_ms: int = VAL_END_MS) -> None:
+    """Taker-buy volume and premium index per 4h bar: [open_ms, volume, taker_buy_volume, premium_close]."""
+    _flow_guard(end_ms)
+    _download_flow(symbols, data_dir, WARMUP_START_MS, end_ms)
+
+
+def _download_flow(symbols: list[str], data_dir: Path, start_ms: int, end_ms: int) -> None:
+    from replay.market_data import _keyless_client
+    data_dir.mkdir(parents=True, exist_ok=True)
+    client = _keyless_client()
+    for symbol in symbols:
+        query = lambda c: {"symbol": symbol, "interval": "4h", "startTime": c, "limit": 1500}
+        klines = _pages(lambda c: [[int(r[0]), float(r[5]), float(r[9])] for r in client.fapiPublicGetKlines(query(c))],
+                        start_ms, end_ms)
+        premium = dict((int(r[0]), float(r[4])) for r in
+                       _pages(lambda c: [[int(r[0])] + r[1:] for r in client.fapiPublicGetPremiumIndexKlines(query(c))],
+                              start_ms, end_ms))
+        rows = np.array([k + [premium.get(k[0], np.nan)] for k in klines], dtype=float)
+        rows = rows[np.unique(rows[:, 0], return_index=True)[1]]
+        np.save(data_dir / f"{symbol}.flow.npy", rows)
+        print(f"{symbol}: {len(rows)} flow bars from {time.strftime('%F', time.gmtime(rows[0, 0] / 1000))}, "
+              f"{int(np.isnan(rows[:, 3]).sum())} without premium", flush=True)
+
+
+def load_flow(symbol: str, end_ms: int = VAL_END_MS, data_dir: Path = FLOW_DIR) -> np.ndarray:
+    _flow_guard(end_ms)
+    rows = np.load(data_dir / f"{symbol}.flow.npy")
+    return rows[rows[:, 0] < end_ms]

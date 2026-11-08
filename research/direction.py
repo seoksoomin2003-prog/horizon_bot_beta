@@ -1,4 +1,5 @@
-"""Direction model for docs/research/direction_preregistration_v3.md. Parameters are fixed there; do not tune."""
+"""Direction model for docs/research/direction_preregistration_v3.md (v4: fixed bet threshold, v5: order-flow and basis
+features). Parameters are fixed in those documents; do not tune."""
 
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ ABS_MOVE = math.sqrt(2 / math.pi)       # mean |x| of a normal with std 1 (0.798
 HORIZONS = {"D4": 1, "D24": 6}
 FEATURES = ["r1", "r6", "r42", "r168", "vol", "vol_change", "btc_r1", "btc_r6", "funding", "volume", "range_pos",
             "hour_sin", "hour_cos"]
+FLOW_FEATURES = ["taker_1", "taker_6", "btc_taker_1", "basis", "basis_change"]     # v5
 
 
 def _funding_sum(fts: np.ndarray, cum: np.ndarray, start: np.ndarray, end: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -26,8 +28,12 @@ def _funding_sum(fts: np.ndarray, cum: np.ndarray, start: np.ndarray, end: np.nd
     return cum[b] - cum[a], b - a
 
 
-def frame(symbol: str, bars: np.ndarray, funding: np.ndarray, btc: pd.DataFrame | None, horizon: int) -> pd.DataFrame:
-    """One row per 4h bar close: the 13 features from data up to that close, the forward log return and the funding paid while held."""
+def frame(symbol: str, bars: np.ndarray, funding: np.ndarray, btc: pd.DataFrame | None, horizon: int,
+          flow: np.ndarray | None = None) -> pd.DataFrame:
+    """One row per 4h bar close: the features from data up to that close, the forward log return and the funding paid while held.
+
+    flow rows are [open_ms, volume, taker_buy_volume, premium_close]; with them the v5 FLOW_FEATURES are added.
+    """
     close_ms = bars[:, 0].astype(np.int64) + BAR_MS
     grid = np.arange(close_ms[0], close_ms[-1] + 1, BAR_MS)
     df = pd.DataFrame(bars[:, 2:6], index=close_ms, columns=["high", "low", "close", "volume_raw"]).reindex(grid)
@@ -53,6 +59,13 @@ def frame(symbol: str, bars: np.ndarray, funding: np.ndarray, btc: pd.DataFrame 
     out["range_pos"] = (df["close"] - lo) / (hi - lo)
     hour = (grid // 3_600_000) % 24
     out["hour_sin"], out["hour_cos"] = np.sin(2 * np.pi * hour / 24), np.cos(2 * np.pi * hour / 24)
+    if flow is not None:
+        f = pd.DataFrame(flow[:, 1:], index=flow[:, 0].astype(np.int64) + BAR_MS, columns=["vol", "buy", "basis"]).reindex(grid)
+        out["taker_1"] = f["buy"] / f["vol"] - 0.5
+        out["taker_6"] = f["buy"].rolling(6, min_periods=6).sum() / f["vol"].rolling(6, min_periods=6).sum() - 0.5
+        out["btc_taker_1"] = out["taker_1"] if btc is None else btc["taker_1"].reindex(grid)
+        out["basis"] = f["basis"]
+        out["basis_change"] = f["basis"].diff(6)
     out["fwd"] = logc.shift(-horizon) - logc
     out["fund_hold"], _ = _funding_sum(fts, cum, grid, grid + horizon * BAR_MS)
     out["symbol"] = symbol
@@ -88,12 +101,15 @@ def month_starts(start_ms: int, end_ms: int) -> list[int]:
 
 
 def walk_forward(data: pd.DataFrame, horizon: int, train_start_ms: int, score_start_ms: int, end_ms: int,
-                 daily_only: bool) -> pd.DataFrame:
-    """Refits on the first of every month on rows whose answer is already known, and predicts that month."""
-    data = data.dropna(subset=FEATURES + ["fwd", "sd42"])
+                 daily_only: bool, features: list[str] = FEATURES, require: list[str] = ()) -> pd.DataFrame:
+    """Refits on the first of every month on rows whose answer is already known, and predicts that month.
+
+    Rows missing any of `require` are dropped too, so two feature sets can be compared on the same rows.
+    """
+    data = data.dropna(subset=list(features) + list(require) + ["fwd", "sd42"])
     data = data[(data["close_ms"] >= train_start_ms) & (data["close_ms"] + horizon * BAR_MS <= end_ms)]
     y_all = (data["fwd"] > 0).to_numpy(float)
-    x_all = data[FEATURES].to_numpy(float)
+    x_all = data[features].to_numpy(float)
     known = (data["close_ms"] + horizon * BAR_MS).to_numpy()
     when = data["close_ms"].to_numpy()
     starts = month_starts(score_start_ms, end_ms)
