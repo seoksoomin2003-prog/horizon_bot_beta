@@ -197,6 +197,8 @@ def run(name: str, start_ms: int, end_ms: int, symbols: list[str], *, initial: f
     import config
     if config.IS_LIVE or config.BINANCE_API_KEY:
         raise RuntimeError("replay must run in paper mode with no keys")
+    # Earlier replays ran futures at 3x and skipped orders below the minimum; screen settings must not change that.
+    config.PAPER_MARKET, config.PAPER_LEVERAGE, config.PAPER_MIN_ORDER = "futures", 3, False
     config.SYMBOLS = list(symbols)
     from logger import errors_logger, trades_logger
     for lg in (trades_logger, errors_logger):

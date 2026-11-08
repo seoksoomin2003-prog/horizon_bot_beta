@@ -369,6 +369,11 @@ class Pipeline:
             try:
                 market = self.dh.exchange.market(self.dh.format_symbol(pos.symbol))
                 min_qty = SafeCore.float(market.get("limits", {}).get("amount", {}).get("min", 0.0))
+                if config.IS_PAPER and config.PAPER_MARKET == "spot" and ticker.last > 0:
+                    # Spot sells below the minimum notional are refused, so partial exits that small are skipped.
+                    from paper.exchange import order_minimums
+                    spot_qty, spot_cost, _ = order_minimums(self.dh.exchange, self.dh.format_symbol(pos.symbol), "spot")
+                    min_qty = max(spot_qty, spot_cost / ticker.last)
             except Exception:
                 min_qty = 0.0
 
@@ -653,8 +658,22 @@ class Pipeline:
             )
 
             # D. EXECUTION STAGE
+            if order_request.approved and config.IS_PAPER:
+                from paper.exchange import fit_order, order_minimums
+                fitted, note = fit_order(
+                    order_request.amount, ticker.last, stop_price, conviction.side, account.equity,
+                    getattr(account, "used_margin", 0.0) or 0.0,
+                    minimums=order_minimums(self.dh.exchange, self.dh.format_symbol(symbol), config.PAPER_MARKET),
+                    market=config.PAPER_MARKET, leverage=config.PAPER_LEVERAGE, raise_to_minimum=config.PAPER_MIN_ORDER)
+                if fitted is None:
+                    trades_logger.info(f"[SKIPPED: PAPER_RULES] {symbol} {conviction.side}: {note}")
+                    return
+                if note:
+                    trades_logger.info(f"[MIN_ORDER] {symbol} {conviction.side}: {note}")
+                order_request.amount = fitted
+
             if order_request.approved:
-                if order_request.amount < 0.001:
+                if not config.IS_PAPER and order_request.amount < 0.001:
                     trades_logger.info(f"[SKIPPED: TOO SMALL] {symbol} {conviction.side} Size: {order_request.amount}")
                     return
 

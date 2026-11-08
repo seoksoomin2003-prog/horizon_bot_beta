@@ -28,6 +28,21 @@ IS_PAPER = not IS_LIVE
 LIVE_CONFIRMED = os.getenv("LIVE_TRADING_CONFIRM", "").strip() == LIVE_CONFIRM_PHRASE
 
 
+def _paper_settings() -> dict:
+    """Screen-chosen paper settings (runtime/paper_settings.json). Live mode ignores them."""
+    from paper import settings as paper_settings
+    if not IS_PAPER:
+        return dict(paper_settings.DEFAULTS, saved=False)
+    runtime_dir = os.environ.get("HORIZON_RUNTIME_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime")
+    saved = paper_settings.load(runtime_dir)
+    if saved is None:
+        return dict(paper_settings.DEFAULTS, initial=float(os.getenv("PAPER_INITIAL_EQUITY", "50")), saved=False)
+    return dict(saved, saved=True)
+
+
+PAPER_SETTINGS = _paper_settings()
+
+
 def _secret(*names: str) -> str:
     """Returns the first set value. Paper mode never loads a secret into memory."""
     if IS_PAPER:
@@ -61,8 +76,11 @@ class Config:
     DEMO_MODE = safe_config("DEMO_MODE", "false").lower() == "true"
 
     # Paper account assumptions (not measured values)
-    PAPER_INITIAL_EQUITY = float(os.getenv("PAPER_INITIAL_EQUITY", "1000"))
-    PAPER_FEE = float(os.getenv("PAPER_FEE", "0.0005"))
+    PAPER_MARKET = PAPER_SETTINGS["market"]            # futures or spot
+    PAPER_LEVERAGE = int(PAPER_SETTINGS["leverage"])   # 1 for spot
+    PAPER_MIN_ORDER = bool(PAPER_SETTINGS["min_order"])  # raise orders below the exchange minimum to it
+    PAPER_INITIAL_EQUITY = float(PAPER_SETTINGS["initial"])
+    PAPER_FEE = float(os.getenv("PAPER_FEE") or (0.001 if PAPER_MARKET == "spot" else 0.0005))
     PAPER_SLIPPAGE_BPS = float(os.getenv("PAPER_SLIPPAGE_BPS", "5"))
 
     # Global Bot State has been moved to utils.runtime_coordinator.RuntimeCoordinator
@@ -79,8 +97,9 @@ class Config:
     MAX_CONCURRENT_POSITIONS = 3
     MAX_SLIPPAGE_PCT = 0.005     # 0.5% Hard limit for market order slippage
     # Institutional exposure ceilings (hard caps)
-    MAX_NOTIONAL_MULTIPLIER = 3.0      # position_notional <= equity * multiplier
-    MAX_EFFECTIVE_LEVERAGE = 3.0       # effective_leverage = notional / equity
+    # In paper mode the screen's leverage replaces the 3x caps; live keeps 3x.
+    MAX_NOTIONAL_MULTIPLIER = float(PAPER_SETTINGS["leverage"]) if IS_PAPER else 3.0  # position_notional <= equity * multiplier
+    MAX_EFFECTIVE_LEVERAGE = float(PAPER_SETTINGS["leverage"]) if IS_PAPER else 3.0   # effective_leverage = notional / equity
     MIN_STOP_DISTANCE_PCT = 0.002      # 0.2% stop floor to prevent ATR-compression overflow
     RECONCILE_INTERVAL = 15      # 15s polling for reconciliation
     EQUITY_ROLLING_WINDOW_DAYS = 10 # 10-day peak for drawdown baseline
@@ -188,5 +207,8 @@ TARGET_RR = Config.TARGET_RR
 DEMO_MODE = Config.DEMO_MODE
 PAPER_INITIAL_EQUITY = Config.PAPER_INITIAL_EQUITY
 PAPER_FEE = Config.PAPER_FEE
+PAPER_MARKET = Config.PAPER_MARKET
+PAPER_LEVERAGE = Config.PAPER_LEVERAGE
+PAPER_MIN_ORDER = Config.PAPER_MIN_ORDER
 PAPER_SLIPPAGE_BPS = Config.PAPER_SLIPPAGE_BPS
 SUPPORTED_TIMEFRAMES = Config.SUPPORTED_TIMEFRAMES

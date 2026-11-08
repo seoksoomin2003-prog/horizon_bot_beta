@@ -1,4 +1,4 @@
-"""The dashboard must stay local, read-only and away from keys."""
+"""The dashboard must stay local and away from keys, and its only write route must start paper trading, never live."""
 import http.client
 import json
 import os
@@ -9,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from dashboard.server import HOST, build_server, build_summary, mask
+from dashboard.server import HOST, archive_records, build_server, build_summary, control, mask, run_script
+from paper import settings as paper_settings
 
 REPO = Path(__file__).resolve().parent.parent
 FAKE_SECRET = "FAKESECRETVALUE_abcdefghijklmnopqrstuvwxyz0123456789"
@@ -50,12 +51,16 @@ def server(root):
     srv.server_close()
 
 
-def request(server, method="GET", path="/", host=None):
+def request(server, method="GET", path="/", host=None, headers=None, body=None):
     port = server.server_address[1]
     conn = http.client.HTTPConnection(HOST, port, timeout=5)
     conn.putrequest(method, path, skip_host=True)
     conn.putheader("Host", host or f"127.0.0.1:{port}")
-    conn.endheaders()
+    for k, v in (headers or {}).items():
+        conn.putheader(k, v)
+    if body is not None:
+        conn.putheader("Content-Length", str(len(body)))
+    conn.endheaders(body)
     res = conn.getresponse()
     body = res.read()
     conn.close()
@@ -67,10 +72,108 @@ def test_listens_on_loopback_only(server):
 
 
 @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
-def test_nothing_can_be_changed(server, root, method):
+def test_records_cannot_be_written_through_other_routes(server, root, method):
     before = (root / "runtime/paper_binance/paper_broker.json").read_bytes()
     assert request(server, method, "/api/summary")[0].status == 405
     assert (root / "runtime/paper_binance/paper_broker.json").read_bytes() == before
+
+
+def control_headers(server, token=None, origin=None):
+    port = server.server_address[1]
+    return {"Origin": origin or f"http://127.0.0.1:{port}", "X-Control-Token": server.RequestHandlerClass.token if token is None else token,
+            "Content-Type": "application/json"}
+
+
+@pytest.mark.parametrize("token,origin", [("wrong", None), ("", None), (None, "http://evil.example"), (None, "null")])
+def test_control_needs_this_pages_token_and_origin(server, root, token, origin):
+    body = json.dumps({"action": "stop"}).encode()
+    res, _ = request(server, "POST", "/api/control", headers=control_headers(server, token, origin), body=body)
+    assert res.status == 403
+
+
+def test_control_without_origin_header_is_refused(server):
+    headers = control_headers(server)
+    del headers["Origin"]
+    assert request(server, "POST", "/api/control", headers=headers, body=b'{"action":"stop"}')[0].status == 403
+
+
+def test_control_rejects_bad_settings_before_touching_anything(server, root):
+    body = json.dumps({"action": "start_new", "settings": {"market": "futures", "leverage": 500, "initial": 50, "min_order": True}}).encode()
+    res, out = request(server, "POST", "/api/control", headers=control_headers(server), body=body)
+    assert res.status == 400 and "레버리지" in json.loads(out)["message"]
+    assert (root / "runtime/paper_binance/paper_broker.json").exists()
+
+
+def test_page_carries_the_control_token(server):
+    html = request(server)[1].decode()
+    assert server.RequestHandlerClass.token in html and "__TOKEN__" not in html
+
+
+def fake_runner(calls, root, running_after=None):
+    def run(r, *args):
+        calls.append(args)
+        pid = r / ".run" / "bot.pid"
+        if args == ("start",):
+            pid.parent.mkdir(exist_ok=True)
+            pid.write_text(str(os.getpid()))
+        elif args == ("stop",):
+            pid.unlink(missing_ok=True)
+        return True, ""
+    return run
+
+
+def test_start_new_keeps_old_records_saves_settings_and_starts_paper(root):
+    calls = []
+    status, out = control(root, "start_new", {"market": "spot", "leverage": 5, "initial": 50, "min_order": True}, runner=fake_runner(calls, root))
+    assert status == 200 and out["ok"], out
+    assert calls == [("start",)]
+    archived = list((root / "runtime/archive").iterdir())
+    assert len(archived) == 1 and (archived[0] / "paper_binance/paper_broker.json").exists() and (archived[0] / "logs_paper/trades.log").exists()
+    assert not (root / "runtime/paper_binance").exists() and not (root / "logs/paper").exists()
+    assert paper_settings.load(root / "runtime") == {"market": "spot", "leverage": 1, "initial": 50.0, "min_order": True}
+
+
+def test_start_new_stops_a_running_bot_first(root):
+    calls = []
+    (root / ".run").mkdir()
+    (root / ".run/bot.pid").write_text(str(os.getpid()))
+    status, _ = control(root, "start_new", {"market": "futures", "leverage": 3, "initial": 50, "min_order": True}, runner=fake_runner(calls, root))
+    assert status == 200 and calls == [("stop",), ("start",)]
+
+
+def test_stop_and_resume(root):
+    calls = []
+    run = fake_runner(calls, root)
+    assert control(root, "stop", runner=run)[1]["message"] == "이미 중지되어 있습니다."
+    assert control(root, "resume", runner=run)[0] == 200
+    assert control(root, "stop", runner=run)[0] == 200
+    assert calls == [("start",), ("stop",)] and (root / "runtime/paper_binance").exists()
+
+
+def test_unknown_action_is_refused(root):
+    assert control(root, "start_live", runner=lambda *a: pytest.fail("must not run"))[0] == 400
+
+
+def test_archive_never_overwrites(root):
+    first = archive_records(root, now=0)
+    (root / "runtime/paper_binance").mkdir()
+    second = archive_records(root, now=0)
+    assert first != second and first.exists() and second.exists()
+
+
+def test_script_runs_without_live_variables(tmp_path, monkeypatch):
+    script = tmp_path / "run_mac.sh"
+    script.write_text('#!/bin/bash\necho "mode=${TRADING_MODE:-unset} confirm=${LIVE_TRADING_CONFIRM:-unset} args=$*"\n')
+    script.chmod(0o755)
+    monkeypatch.setenv("TRADING_MODE", "live")
+    monkeypatch.setenv("LIVE_TRADING_CONFIRM", "I_ACCEPT_REAL_LOSSES")
+    ok, out = run_script(tmp_path, "start")
+    assert ok and out == "mode=unset confirm=unset args=start"
+
+
+def test_real_launcher_never_starts_live_without_the_flag():
+    text = (REPO / "run_mac.sh").read_text()
+    assert 'if [ "${2:-}" = "--live" ]' in text and "export TRADING_MODE=paper" in text
 
 
 def test_foreign_host_is_refused(server):
@@ -89,13 +192,14 @@ def test_key_never_reaches_a_response(server):
         assert FAKE_SECRET.encode() not in request(server, path=path)[1]
 
 
-def test_page_has_no_outside_resources_and_no_controls(server):
+def test_page_has_no_outside_resources(server):
     res, body = request(server)
     html = body.decode()
     assert "connect-src 'self'" in res.getheader("Content-Security-Policy")
+    assert "form-action 'none'" in res.getheader("Content-Security-Policy")
     assert res.getheader("X-Content-Type-Options") == "nosniff"
     assert "__NONCE__" not in html
-    for banned in ("<button", "<form", "<input", "innerHTML", "https://", "method:"):
+    for banned in ("<form", "innerHTML", "https://", "--live"):
         assert banned not in html.replace("http://www.w3.org/2000/svg", "")
 
 

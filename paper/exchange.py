@@ -8,15 +8,20 @@ Fill model (assumptions, not measurements):
 - Stops trigger on 1-minute last-price bars, not the mark price. They fill at the trigger or a worse gap open, plus
   slippage. Take-profits fill at the trigger, minus slippage. If both trigger in one bar, the stop goes first.
 - Resting orders keep working while the program is off, as exchange-side orders do: missed bars are replayed.
-- Not modelled: funding, liquidation, partial fills, order book depth, rejections for exchange rate limits.
+- Futures: a position is liquidated when a bar opens past its liquidation price, or crosses it with no stop in front.
+  Isolated-margin approximation with a 0.5% maintenance rate; the whole margin is lost at the bankruptcy price.
+- Spot: no leverage and no short selling. Prices still come from the futures feed the strategy reads.
+- Not modelled: funding, partial fills, order book depth, rejections for exchange rate limits.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import math
 import threading
 import time
+from decimal import Decimal
 from typing import Any, Callable, Optional
 
 import ccxt
@@ -29,6 +34,7 @@ MINUTE_MS = 60_000
 MAX_REPLAY_BARS = 1000
 RECENT_LIMIT = 500
 AMOUNT_DECIMALS = 10
+MAINTENANCE_RATE = 0.005
 
 
 class PaperBlocked(AttributeError):
@@ -39,12 +45,14 @@ class PaperBroker:
     """Account, position and order book of the simulation. All mutation happens under one lock and is persisted."""
 
     def __init__(self, state_path: str, *, initial: float = 1000.0, fee: float = 0.0005, slippage_bps: float = 5.0,
-                 leverage: float = 3.0, match_interval_s: float = 3.0):
+                 leverage: float = 3.0, match_interval_s: float = 3.0, market: str = "futures", min_order: bool = False):
         self.state_path = state_path
         self.ledger_path = os.path.join(os.path.dirname(state_path), "paper_trades.jsonl")
         self.fee = fee
         self.slip = slippage_bps / 10_000.0
-        self.leverage = leverage
+        self.market = market
+        self.leverage = 1.0 if market == "spot" else leverage
+        self.min_order = min_order
         self.match_interval_s = match_interval_s
         self.lock = threading.RLock()
         self._net_lock = threading.Lock()   # ccxt clients are not shared across threads without it
@@ -61,7 +69,8 @@ class PaperBroker:
                 pos["amount"] = round(pos["amount"], AMOUNT_DECIMALS)
             return state
         return {"initial": initial, "cash": initial, "realized": 0.0, "fees": 0.0, "seq": 0, "positions": {},
-                "orders": {}, "done": {}, "trades": [], "last_checked": {}}
+                "orders": {}, "done": {}, "trades": [], "last_checked": {},
+                "settings": {"market": self.market, "leverage": self.leverage, "fee": self.fee, "min_order": self.min_order}}
 
     def _save(self) -> None:
         atomic_write_json(self.state_path, self.state)
@@ -123,6 +132,7 @@ class PaperBroker:
             else:
                 self.state["positions"][symbol] = {"side": "LONG" if side == "buy" else "SHORT", "amount": qty,
                                                    "entry": price, "opened_ms": now_ms}
+                self.state["last_checked"].setdefault(symbol, now_ms)
             filled += qty
         fee = filled * price * self.fee
         self.state["cash"] += realized - fee
@@ -155,6 +165,8 @@ class PaperBroker:
                 closing = bool(pos) and (pos["side"] == "LONG") != (side == "buy")
                 if reduce_only and not closing:
                     raise ccxt.InvalidOrder(f"paper: reduce-only order with no position to reduce on {symbol}")
+                if self.market == "spot" and side == "sell" and not closing:
+                    raise ccxt.InvalidOrder(f"paper: spot has no short selling ({symbol})")
                 if not closing and self._free_locked() < qty * px / self.leverage:
                     raise ccxt.InsufficientFunds(f"paper: margin too low for {qty} {symbol}")
                 now = self._now_ms()
@@ -201,10 +213,42 @@ class PaperBroker:
         self._fill(order, px, now_ms, "stop" if order["type"] in STOP_TYPES else "take_profit")
         self._finish(order, "closed")
 
+    def liquidation_price(self, pos: dict) -> float:
+        lev = self.leverage
+        if pos["side"] == "LONG":
+            return pos["entry"] * (1 - 1 / lev + MAINTENANCE_RATE)
+        return pos["entry"] * (1 + 1 / lev - MAINTENANCE_RATE)
+
+    def _liquidate(self, symbol: str, pos: dict, now_ms: int) -> None:
+        bankrupt = pos["entry"] * (1 - 1 / self.leverage if pos["side"] == "LONG" else 1 + 1 / self.leverage)
+        order = {"id": self._next_id("L"), "client_id": None, "symbol": symbol, "type": "LIQUIDATION",
+                 "side": "sell" if pos["side"] == "LONG" else "buy", "amount": pos["amount"], "reduce_only": True,
+                 "created_ms": now_ms}
+        self._fill(order, bankrupt, now_ms, "liquidation")
+        self._finish(order, "closed")
+        for other in [o for o in self.state["orders"].values() if o["symbol"] == symbol]:
+            self._finish(other, "expired")
+
+    def _check_liquidation(self, sym: str, t: int, o: float, h: float, low: float, now_ms: int) -> bool:
+        pos = self.state["positions"].get(sym)
+        if self.market != "futures" or not pos or t < pos["opened_ms"] // MINUTE_MS * MINUTE_MS + MINUTE_MS:
+            return False
+        liq, long = self.liquidation_price(pos), pos["side"] == "LONG"
+        gapped = o <= liq if long else o >= liq
+        crossed = low <= liq if long else h >= liq
+        # A stop between the price and the liquidation level is reached first, unless the bar opens past both.
+        guarded = any(x["symbol"] == sym and x["type"] in STOP_TYPES and (x["trigger"] > liq if long else x["trigger"] < liq)
+                      for x in self.state["orders"].values())
+        if gapped or (crossed and not guarded):
+            self._liquidate(sym, pos, now_ms)
+            return True
+        return False
+
     def match(self, symbol: Optional[str] = None, *, force: bool = False) -> None:
         """Replays 1-minute bars since the last check against resting orders. Bars are fetched outside the lock."""
         with self.lock:
-            symbols = sorted({o["symbol"] for o in self.state["orders"].values()})
+            symbols = sorted({o["symbol"] for o in self.state["orders"].values()} |
+                             (set(self.state["positions"]) if self.market == "futures" else set()))
         if symbol is not None:
             symbols = [s for s in symbols if s == symbol]
         for sym in symbols:
@@ -223,6 +267,8 @@ class PaperBroker:
         changed = False
         for bar in bars:
             t, o, h, l = int(bar[0]), float(bar[1]), float(bar[2]), float(bar[3])
+            if self._check_liquidation(sym, t, o, h, l, min(now, t + MINUTE_MS - 1)):
+                changed = True
             live = sorted((x for x in self.state["orders"].values() if x["symbol"] == sym),
                           key=lambda x: (x["type"] not in STOP_TYPES, x["created_ms"]))
             for order in live:
@@ -401,5 +447,62 @@ def get_broker() -> PaperBroker:
         if _broker is None:
             import config
             _broker = PaperBroker(get_absolute_path("paper_broker.json"), initial=config.PAPER_INITIAL_EQUITY, fee=config.PAPER_FEE,
-                                  slippage_bps=config.PAPER_SLIPPAGE_BPS, leverage=config.MAX_EFFECTIVE_LEVERAGE)
+                                  slippage_bps=config.PAPER_SLIPPAGE_BPS, leverage=config.PAPER_LEVERAGE,
+                                  market=config.PAPER_MARKET, min_order=config.PAPER_MIN_ORDER)
         return _broker
+
+
+_spot_markets: Optional[dict] = None
+
+
+def _spot_market(symbol: str) -> dict:
+    """Spot rules (minimum size and amount step) from a keyless spot client, loaded once."""
+    global _spot_markets
+    with _markets_lock:
+        if _spot_markets is None:
+            client = ccxt.binance({"enableRateLimit": True, "timeout": 10_000, "options": {"defaultType": "spot"}})
+            _spot_markets = client.load_markets()
+    return _spot_markets[symbol.split(":")[0]]
+
+
+def order_minimums(public: Any, symbol: str, market: str) -> tuple[float, float, float]:
+    """(minimum amount, minimum notional in USDT, amount step) for the paper market in use."""
+    m = _spot_market(symbol) if market == "spot" else public.market(symbol)
+    limits = m.get("limits", {})
+    return (float(limits.get("amount", {}).get("min") or 0.0), float(limits.get("cost", {}).get("min") or 0.0),
+            float(m.get("precision", {}).get("amount") or 0.0))
+
+
+def _ceil_to_step(value: float, step: float) -> float:
+    if step <= 0:
+        return value
+    units = math.ceil(value / step - 1e-9)
+    return float(Decimal(units) * Decimal(str(step)))
+
+
+def fit_order(amount: float, price: float, stop: float, side: str, equity: float, used_margin: float, *,
+              minimums: tuple[float, float, float], market: str, leverage: float, raise_to_minimum: bool) -> tuple[Optional[float], str]:
+    """Applies the paper market's rules to a sized entry. Returns (amount or None to skip, explanation)."""
+    if market == "spot" and side == "SHORT":
+        return None, "spot has no short selling"
+    if price <= 0 or equity <= 0:
+        return None, "no price or equity"
+    min_qty, min_cost, step = minimums
+    # 1% above the minimum notional, so a small price move before the fill does not drop it below.
+    need = max(min_qty, min_cost * 1.01 / price)
+    note = ""
+    if amount < need:
+        if not raise_to_minimum:
+            return None, f"below exchange minimum ({amount * price:.2f} < {min_cost:g} USDT)"
+        raised = _ceil_to_step(need, step)
+        note = f"raised to exchange minimum {amount:.8g} -> {raised:.8g} ({raised * price:.2f} USDT)"
+        amount = raised
+    lev = 1.0 if market == "spot" else float(leverage)
+    notional = amount * price
+    if notional > lev * equity:
+        return None, f"order {notional:.2f} USDT is more than {lev:g}x equity {equity:.2f}"
+    if notional / lev > equity - used_margin:
+        return None, f"order needs {notional / lev:.2f} USDT margin, free {equity - used_margin:.2f}"
+    if note:
+        note += f", risk to stop {amount * abs(price - stop) / equity:.2%} of equity"
+    return amount, note

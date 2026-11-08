@@ -59,6 +59,19 @@ tr:last-child td { border-bottom: 0; }
 .log li:last-child { border-bottom: 0; }
 .log time { color: var(--text-2); margin-right: 8px; font-variant-numeric: tabular-nums; }
 footer { color: var(--muted); font-size: 13px; }
+.controls { display: flex; flex-wrap: wrap; gap: 12px 16px; align-items: flex-end; }
+.field { display: grid; gap: 4px; }
+.field span { color: var(--text-2); font-size: 13px; }
+.field select, .field input[type=number] { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--axis);
+  border-radius: 6px; padding: 6px 8px; min-width: 110px; }
+.check { display: inline-flex; gap: 6px; align-items: center; padding-bottom: 7px; }
+.buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+button { font: inherit; border-radius: 6px; padding: 7px 14px; border: 1px solid var(--axis); background: var(--surface); color: var(--text); cursor: pointer; }
+button.primary { background: var(--series); border-color: var(--series); color: #fff; }
+button:disabled { opacity: .5; cursor: default; }
+.current { margin: 0 0 12px; color: var(--text-2); }
+.message { margin-top: 10px; }
+.message.bad { color: var(--critical); }
 @media (max-width: 760px) { .overview, .columns { grid-template-columns: minmax(0, 1fr); } .hero { font-size: 32px; } }
 </style>
 </head>
@@ -68,8 +81,26 @@ footer { color: var(--muted); font-size: 13px; }
     <h1>가상 매매 현황</h1>
     <div class="status" role="status"><span id="dot" class="dot"></span><span id="status">불러오는 중</span></div>
   </header>
-  <div class="notice">실제 돈이 아닌 가상 매매입니다. 이 화면은 보기 전용이며, 주문이나 설정을 바꿀 수 없습니다.</div>
+  <div class="notice">실제 돈이 아닌 가상 매매입니다. 이 화면에서는 가상 매매만 켜고 끌 수 있고, 실거래는 켤 수 없습니다.</div>
   <div id="alert" class="notice alert" hidden></div>
+
+  <section class="card" aria-label="가상 매매 실행">
+    <h2>가상 매매 실행 <span class="label">전략: 봇의 현재 15분봉 규칙 (검증된 수익 근거 없음)</span></h2>
+    <p class="current" id="current">현재 설정을 불러오는 중</p>
+    <div class="controls">
+      <label class="field"><span>시장</span>
+        <select id="market"><option value="futures">선물</option><option value="spot">현물 (롱만, 레버리지 없음)</option></select></label>
+      <label class="field"><span>레버리지 (배)</span><input id="leverage" type="number" min="1" max="20" step="1" value="3"></label>
+      <label class="field"><span>시작 자금 (USDT)</span><input id="initial" type="number" min="10" step="1" value="50"></label>
+      <label class="check"><input id="minorder" type="checkbox" checked> 최소 주문 금액에 맞춤</label>
+      <div class="buttons">
+        <button id="startnew" class="primary" type="button">새 가상 매매 시작</button>
+        <button id="stop" type="button">중지</button>
+        <button id="resume" type="button">다시 켜기 (기록 이어서)</button>
+      </div>
+    </div>
+    <div class="message label" id="message" role="status"></div>
+  </section>
 
   <section class="card overview" aria-label="계좌 요약">
     <div>
@@ -127,7 +158,7 @@ footer { color: var(--muted); font-size: 13px; }
     <ul class="log" id="activity"></ul>
   </section>
 
-  <footer id="foot">자금조달비용, 강제청산, 호가 깊이는 반영하지 않아 실제 결과는 더 나쁠 수 있습니다.</footer>
+  <footer id="foot">자금조달비용과 호가 깊이는 반영하지 않고, 강제청산은 근사치입니다(격리 마진, 유지증거금 0.5%). 현물도 가격은 선물 시세를 씁니다. 실제 결과는 더 나쁠 수 있습니다.</footer>
 </main>
 <script nonce="__NONCE__">
 "use strict";
@@ -138,7 +169,61 @@ const signed = (v, d = 2) => (v > 0 ? "+" : "") + money(v, d);
 const pct = (v, d = 2) => (v * 100).toFixed(d) + "%";
 const price = (v) => v == null ? "없음" : Number(v).toLocaleString("ko-KR", { maximumSignificantDigits: 7 });
 const when = (ms) => ms ? new Date(ms).toLocaleString("ko-KR", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }) : "없음";
-const REASONS = { market: "시장가", stop: "손절", take_profit: "익절" };
+const REASONS = { market: "시장가", stop: "손절", take_profit: "익절", liquidation: "강제청산" };
+const TOKEN = "__TOKEN__";
+const sym = (s) => String(s).split(":")[0];
+const MARKET_NAMES = { futures: "선물", spot: "현물" };
+let formReady = false, busy = false;
+
+function settingsText(s) {
+  if (!s) return "설정 정보 없음";
+  const lev = s.market === "spot" ? "레버리지 없음" : `레버리지 ${s.leverage}배`;
+  const fee = s.fee != null ? ` · 수수료 ${(s.fee * 100).toFixed(2)}%` : "";
+  return `${MARKET_NAMES[s.market] || s.market} · ${lev}${fee} · 최소 주문 맞춤 ${s.min_order ? "켬" : "끔"}`;
+}
+function syncLeverage() {
+  const spot = $("market").value === "spot";
+  $("leverage").disabled = spot;
+  if (spot) $("leverage").value = 1;
+}
+function fillForm(s) {
+  if (formReady || !s) return;
+  $("market").value = s.market; $("leverage").value = s.leverage; $("initial").value = s.initial; $("minorder").checked = !!s.min_order;
+  syncLeverage();
+  formReady = true;
+}
+function say(text, bad) {
+  $("message").textContent = text;
+  $("message").className = "message label" + (bad ? " bad" : "");
+}
+async function send(action, settings) {
+  busy = true;
+  for (const id of ["startnew", "stop", "resume"]) $(id).disabled = true;
+  say("처리 중입니다. 최대 1분 걸릴 수 있습니다.");
+  try {
+    const res = await fetch("/api/control", { method: "POST", headers: { "Content-Type": "application/json", "X-Control-Token": TOKEN },
+      body: JSON.stringify({ action, settings }) });
+    const out = await res.json().catch(() => ({ ok: false, message: `요청 실패 (${res.status})` }));
+    say(out.message, !out.ok);
+  } catch (err) {
+    say("화면 서버와 연결하지 못했습니다.", true);
+  } finally {
+    busy = false;
+    await refresh();
+  }
+}
+function readForm() {
+  return { market: $("market").value, leverage: Number($("leverage").value), initial: Number($("initial").value), min_order: $("minorder").checked };
+}
+$("market").addEventListener("change", syncLeverage);
+$("startnew").addEventListener("click", () => {
+  const s = readForm();
+  const lev = s.market === "spot" ? "" : `, 레버리지 ${s.leverage}배`;
+  if (!confirm(`${MARKET_NAMES[s.market]}${lev}, 시작 자금 ${s.initial} USDT로 새로 시작합니다.\n지금 기록은 지우지 않고 보관 폴더로 옮깁니다. 진행할까요?`)) return;
+  send("start_new", s);
+});
+$("stop").addEventListener("click", () => send("stop"));
+$("resume").addEventListener("click", () => send("resume"));
 
 function row(cells) {
   const tr = document.createElement("tr");
@@ -253,9 +338,19 @@ function render(d) {
   const alert = $("alert");
   alert.hidden = cls === "good";
   alert.textContent = !b.running
-    ? "봇이 꺼져 있습니다. 표시된 값은 마지막 기록입니다. 터미널에서 ./run_mac.sh start로 다시 켤 수 있습니다."
+    ? "봇이 꺼져 있습니다. 표시된 값은 마지막 기록입니다. 위의 '다시 켜기'나 '새 가상 매매 시작'으로 켤 수 있습니다."
     : "봇 프로세스는 있지만 기록이 갱신되지 않고 있습니다. 터미널에서 ./run_mac.sh logs를 확인해 주세요.";
 
+  const run = d.run_settings;
+  $("current").textContent = run
+    ? `실행 중인 기록의 설정: ${settingsText(run)} · 시작 자금 ${money(d.initial)} USDT`
+    : (d.settings ? `저장된 설정: ${settingsText(d.settings)} · 시작 자금 ${money(d.settings.initial)} USDT (아직 체결 없음)` : "저장된 설정이 없습니다. 봇 기본값(선물 3배, 최소 주문 맞춤)으로 동작합니다.");
+  fillForm(d.settings || (run && { ...run, initial: d.initial }));
+  if (!busy) {
+    $("stop").disabled = !b.running;
+    $("resume").disabled = b.running;
+    $("startnew").disabled = false;
+  }
   $("errcount").textContent = d.error_count_recent ? `최근 ${d.error_count_recent}건` : "";
   fillLog("errors", d.errors, "최근 오류가 없습니다.");
   fillLog("activity", d.activity, "아직 기록된 활동이 없습니다.");
@@ -272,9 +367,9 @@ function render(d) {
   sample.hidden = d.closes >= SAMPLE_GUIDE;
   sample.textContent = `청산 ${d.closes}건입니다. 표본이 적어 이 수치로 수익성을 판단할 수 없습니다. (${SAMPLE_GUIDE}건은 최소한의 참고선이며, 넘어도 수익을 보장하지 않습니다.)`;
 
-  fillRows("positions", d.positions.map((p) => row([[p.symbol], [p.side === "LONG" ? "롱" : "숏"], [price(p.amount), 1], [price(p.entry), 1], [price(p.stop), 1], [price(p.take_profit), 1], [when(p.opened_ms)]])), "보유 포지션이 없습니다.", 7);
-  fillRows("symbols", d.by_symbol.map((r) => row([[r.symbol], [signed(r.pnl), 1], [r.closes, 1], [r.wins, 1]])), "아직 체결 기록이 없습니다.", 4);
-  fillRows("fills", d.recent_fills.map((f) => row([[when(f.time_ms)], [f.symbol], [f.is_close ? "청산" : "진입"], [REASONS[f.reason] || f.reason || ""], [price(f.price), 1], [price(f.amount), 1], [f.is_close ? signed(f.realized - f.fee) : "", 1], [money(f.fee, 4), 1]])), "아직 체결 기록이 없습니다.", 8);
+  fillRows("positions", d.positions.map((p) => row([[sym(p.symbol)], [p.side === "LONG" ? "롱" : "숏"], [price(p.amount), 1], [price(p.entry), 1], [price(p.stop), 1], [price(p.take_profit), 1], [when(p.opened_ms)]])), "보유 포지션이 없습니다.", 7);
+  fillRows("symbols", d.by_symbol.map((r) => row([[sym(r.symbol)], [signed(r.pnl), 1], [r.closes, 1], [r.wins, 1]])), "아직 체결 기록이 없습니다.", 4);
+  fillRows("fills", d.recent_fills.map((f) => row([[when(f.time_ms)], [sym(f.symbol)], [f.is_close ? "청산" : "진입"], [REASONS[f.reason] || f.reason || ""], [price(f.price), 1], [price(f.amount), 1], [f.is_close ? signed(f.realized - f.fee) : "", 1], [money(f.fee, 4), 1]])), "아직 체결 기록이 없습니다.", 8);
   drawChart();
 }
 

@@ -12,6 +12,8 @@ data/*.log
 
 logs/paper/
 runtime/paper_*/
+runtime/archive/
+runtime/paper_settings.json
 .venv/
 .run/
 
