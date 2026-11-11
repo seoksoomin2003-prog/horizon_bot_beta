@@ -9,6 +9,10 @@ training-time measure. On coins the model never saw, the top 10% hit about 56% a
 and keeps score. A prediction is only recorded within MAX_LATE_MS of the close, so a laptop that slept through a close
 skips it instead of predicting after the fact.
 
+It records a second kind of prediction too, "relative": the probability that the coin does better than the median
+coin over the same 4 or 8 hours. On 46 coins that model never saw, its top 10% hit 57% and 58%, above 55% in every
+year (docs/research/direction_result_v9.md). BTCDOMUSDT, an index product, is left out of it.
+
 Each model refits on the first of every month on rows whose answer was known by then, exactly as in the research.
 
   .venv/bin/python -m predictor.live         (normally through ./run_predictor.sh)
@@ -28,7 +32,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from research.direction import ABS_MOVE, CLIP, FEATURES, fit, frame, predict  # noqa: E402
+from research.direction import ABS_MOVE, CLIP, FEATURES, MARKET_FEATURES, add_relative, fit, frame, predict  # noqa: E402
 from research.h4_data import BAR_MS, DEV_START_MS, SYMBOLS, V6_DIR, V6_SYMBOLS_FILE, WARMUP_START_MS, _pages  # noqa: E402
 from predictor.collect import Collector  # noqa: E402
 
@@ -36,6 +40,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DIR = ROOT / "runtime" / "predictor"
 SIGNAL_GAIN = 0.005             # v4's fixed bet threshold: expected gain above 0.5%
 HORIZONS = (1, 2)              # bars ahead: 4 hours and 8 hours
+NOT_RELATIVE = {"BTCDOMUSDT"}   # an index product: no part of the median coin (v9)
 MAX_LATE_MS = 15 * 60_000
 WAKE_AFTER_CLOSE_MS = 60_000
 
@@ -115,20 +120,31 @@ class Model:
 
     It learns from every coin it predicts (v7 H2: learning from more coins predicted unseen coins better) and keeps
     `thr` and `thr95`, the 90th and 95th percentiles of |p - 0.5| on its training rows: the "confident" cutoffs.
+
+    With `relative` it answers "will the coin beat the median coin?" instead (v9), with two more features.
     """
 
-    def __init__(self, horizon: int = 1) -> None:
-        self.horizon = horizon
+    def __init__(self, horizon: int = 1, relative: bool = False) -> None:
+        self.horizon, self.relative = horizon, relative
+        self.kind = "relative" if relative else "direction"
+        self.features = FEATURES + MARKET_FEATURES if relative else FEATURES
         self.month: int | None = None
         self.train_rows = 0
+
+    def prepare(self, data: pd.DataFrame) -> pd.DataFrame:
+        """The rows this model learns from and predicts: for a relative model, measured against the median coin."""
+        if not self.relative:
+            return data
+        data = data[~data["symbol"].isin(NOT_RELATIVE)]
+        return add_relative(data, set(data["symbol"]))
 
     def refit_if_needed(self, data: pd.DataFrame, now_ms: int) -> None:
         month = int(pd.Timestamp(now_ms, unit="ms").to_period("M").start_time.value // 1_000_000)
         if month == self.month:
             return
-        rows = data.dropna(subset=FEATURES + ["fwd", "sd42"])
+        rows = data.dropna(subset=self.features + ["fwd", "sd42"])
         rows = rows[(rows["close_ms"] >= DEV_START_MS) & (rows["close_ms"] + self.horizon * BAR_MS <= month)]
-        x = rows[FEATURES].to_numpy(float)
+        x = rows[self.features].to_numpy(float)
         self.mean, self.std = x.mean(axis=0), x.std(axis=0)
         self.std[self.std == 0] = 1.0
         self.w = fit(self._scale(x), (rows["fwd"] > 0).to_numpy(float))
@@ -139,14 +155,14 @@ class Model:
         return np.clip((x - self.mean) / self.std, -CLIP, CLIP)
 
     def predict(self, rows: pd.DataFrame) -> np.ndarray:
-        return predict(self.w, self._scale(rows[FEATURES].to_numpy(float)))
+        return predict(self.w, self._scale(rows[self.features].to_numpy(float)))
 
 
 def predictions_for(rows: pd.DataFrame, p: np.ndarray, close_ms: int, model: Model, made_ms: int) -> list[dict]:
     out = []
     for (_, r), prob in zip(rows.iterrows(), p):
         gain = abs(2 * prob - 1) * r["sd42"] * math.sqrt(model.horizon) * ABS_MOVE
-        out.append({"close_ms": close_ms, "horizon": model.horizon, "symbol": r["symbol"], "price": float(math.exp(r["logc"])),
+        out.append({"close_ms": close_ms, "horizon": model.horizon, "kind": model.kind, "symbol": r["symbol"], "price": float(math.exp(r["logc"])),
                     "p_up": float(prob), "expected_gain": float(gain), "signal": bool(gain > SIGNAL_GAIN),
                     "confident": bool(abs(prob - 0.5) >= model.thr), "top5": bool(abs(prob - 0.5) >= model.thr95),
                     "model_month": model.month, "made_ms": made_ms})
@@ -155,17 +171,25 @@ def predictions_for(rows: pd.DataFrame, p: np.ndarray, close_ms: int, model: Mod
 
 def outcomes_for(predicted: list[dict], scored: set, data: pd.DataFrame) -> list[dict]:
     """The close at the end of the horizon for every prediction not yet scored whose horizon has ended.
-    Rows written before 8-hour predictions existed have no `horizon`: they are 4-hour ones."""
-    close = data.set_index(["symbol", "close_ms"])["logc"]
+    Rows written before 8-hour predictions existed have no `horizon`: they are 4-hour ones. A relative prediction also
+    gets `relative_return`: the coin's return minus the median coin's (`fwd` of the relative model's rows)."""
+    indexed = data.set_index(["symbol", "close_ms"])
+    close = indexed["logc"]
     out = []
     for p in predicted:
-        horizon = p.get("horizon", 1)
-        key = (p["symbol"], p["close_ms"], horizon)
+        horizon, kind = p.get("horizon", 1), p.get("kind", "direction")
+        key = (p["symbol"], p["close_ms"], horizon, kind)
         nxt = (p["symbol"], p["close_ms"] + horizon * BAR_MS)
         if key in scored or nxt not in close.index or not np.isfinite(close[nxt]):
             continue
-        out.append({"close_ms": p["close_ms"], "horizon": horizon, "symbol": p["symbol"], "next_price": float(math.exp(close[nxt])),
-                    "log_return": float(close[nxt] - math.log(p["price"]))})
+        row = {"close_ms": p["close_ms"], "horizon": horizon, "kind": kind, "symbol": p["symbol"],
+               "next_price": float(math.exp(close[nxt])), "log_return": float(close[nxt] - math.log(p["price"]))}
+        if kind == "relative":
+            relative = indexed["fwd"].get(key[:2], np.nan)
+            if not np.isfinite(relative):
+                continue
+            row["relative_return"] = float(relative)
+        out.append(row)
     return out
 
 
@@ -178,15 +202,18 @@ def with_closes(data: pd.DataFrame, bars: dict[str, np.ndarray]) -> pd.DataFrame
 def cycle(market: Market, models: list[Model], directory: Path, now_ms: int, clock=time.time) -> str:
     market.update(now_ms)
     predicted = read_jsonl(directory / "predictions.jsonl")
-    scored = {(o["symbol"], o["close_ms"], o.get("horizon", 1)) for o in read_jsonl(directory / "outcomes.jsonl")}
+    scored = {(o["symbol"], o["close_ms"], o.get("horizon", 1), o.get("kind", "direction"))
+              for o in read_jsonl(directory / "outcomes.jsonl")}
     latest = now_ms // BAR_MS * BAR_MS
-    messages = []
+    messages, frames = [], {}
     for model in models:
-        data = with_closes(market.frames(model.horizon), market.bars)
+        if model.horizon not in frames:
+            frames[model.horizon] = with_closes(market.frames(model.horizon), market.bars)
+        data = model.prepare(frames[model.horizon])
         model.refit_if_needed(data, now_ms)
-        mine = [p for p in predicted if p.get("horizon", 1) == model.horizon]
+        mine = [p for p in predicted if p.get("horizon", 1) == model.horizon and p.get("kind", "direction") == model.kind]
         append(directory / "outcomes.jsonl", outcomes_for(mine, scored, data))
-        rows = data[data["close_ms"] == latest].dropna(subset=FEATURES + ["sd42", "logc"])
+        rows = data[data["close_ms"] == latest].dropna(subset=model.features + ["sd42", "logc"])
         made = int(clock() * 1000)
         if latest in {p["close_ms"] for p in mine}:
             messages.append("already predicted")
@@ -197,7 +224,7 @@ def cycle(market: Market, models: list[Model], directory: Path, now_ms: int, clo
         else:
             append(directory / "predictions.jsonl", predictions_for(rows, model.predict(rows), latest, model, made))
             messages.append(f"predicted {len(rows)} coins")
-    return next((m for m in messages if m.startswith("predicted")), messages[0])
+    return next((m for m in messages if m.startswith("predicted")), messages[0])     # the first model predicts every coin
 
 
 def collect_symbols() -> list[str]:
@@ -213,7 +240,7 @@ def main() -> int:
     DIR.mkdir(parents=True, exist_ok=True)
     client = _keyless_client()
     symbols = collect_symbols()
-    market, models = Market(DIR, client, symbols), [Model(h) for h in HORIZONS]
+    market, models = Market(DIR, client, symbols), [Model(h, relative) for relative in (False, True) for h in HORIZONS]
     collector = Collector(DIR, client, symbols)
     collector.start_liquidations()
     print("direction predictor started: no orders, public prices only", flush=True)

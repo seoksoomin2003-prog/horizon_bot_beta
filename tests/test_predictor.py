@@ -197,3 +197,47 @@ def test_order_book_imbalance_and_liquidation_rows():
     assert liquidation_row(message, {"BTCUSDT"}) == {"ts": 123, "symbol": "BTCUSDT", "side": "SELL", "value": 10000.0}
     assert liquidation_row({"stream": "!forceOrder@arr", "data": message}, {"BTCUSDT"})["value"] == 10000.0
     assert liquidation_row(message, {"ETHUSDT"}) is None and liquidation_row({"o": {"s": "BTCUSDT"}}, {"BTCUSDT"}) is None
+
+
+def test_relative_prediction_is_scored_against_the_median_coin(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "DEV_START_MS", 0)
+    close = T0 + 400 * BAR_MS
+    market = FakeMarket(close)
+    market.symbols.append("BTCDOMUSDT")              # the index product is never part of the relative prediction
+    market.bars["BTCDOMUSDT"], market.funding["BTCDOMUSDT"] = market.bars["ETHUSDT"] * [1, 3, 3, 3, 3, 1], market.funding["ETHUSDT"]
+    models = [live.Model(2, relative=True)]
+    cycle = lambda now: live.cycle(market, models, tmp_path, now, clock=lambda: now / 1000)
+    assert cycle(close + 60_000) == f"predicted {len(SYMBOLS)} coins"
+    rows = live.read_jsonl(tmp_path / "predictions.jsonl")
+    assert {r["symbol"] for r in rows} == set(SYMBOLS) and {(r["kind"], r["horizon"]) for r in rows} == {("relative", 2)}
+    for step, eth in ((1, 1.02), (2, 1.05)):         # two more bars: every coin +2% each, ETH +5% on the second
+        for s in market.symbols:
+            last = market.bars[s][-1].copy()
+            last[0] += BAR_MS
+            last[1:5] *= eth if s == "ETHUSDT" else 1.02
+            market.bars[s] = np.vstack([market.bars[s], last])
+        cycle(close + step * BAR_MS + 60_000)
+    outcomes = {o["symbol"]: o for o in live.read_jsonl(tmp_path / "outcomes.jsonl") if o["close_ms"] == close}
+    assert set(outcomes) == set(SYMBOLS) and all(o["kind"] == "relative" for o in outcomes.values())
+    assert math.isclose(outcomes["ETHUSDT"]["relative_return"], math.log(1.05) - math.log(1.02))     # the median coin made 2 x 2%
+    assert math.isclose(outcomes["BTCUSDT"]["relative_return"], 0.0, abs_tol=1e-12)
+    assert math.isclose(outcomes["BTCUSDT"]["log_return"], 2 * math.log(1.02))
+
+
+def test_dashboard_scores_relative_predictions_apart(tmp_path):
+    folder = tmp_path / "runtime/predictor"
+    folder.mkdir(parents=True)
+    base = {"close_ms": 0, "horizon": 2, "kind": "relative", "price": 1.0}
+    write(folder / "predictions.jsonl", [
+        {"close_ms": 0, "symbol": "BTCUSDT", "price": 100.0, "p_up": 0.6, "expected_gain": 0.001, "signal": False},
+        {**base, "symbol": "BTCUSDT", "p_up": 0.7, "confident": True, "top5": True},
+        {**base, "symbol": "ETHUSDT", "p_up": 0.4, "confident": True, "top5": False},
+        {**base, "symbol": "SOLUSDT", "p_up": 0.55, "confident": False, "top5": False, "horizon": 1}])
+    write(folder / "outcomes.jsonl", [
+        {**base, "symbol": "BTCUSDT", "log_return": -0.01, "relative_return": 0.02},     # fell, but less than the median coin: a hit
+        {**base, "symbol": "ETHUSDT", "log_return": -0.03, "relative_return": 0.01},
+        {**base, "symbol": "SOLUSDT", "horizon": 1, "log_return": 0.01, "relative_return": 0.001}])
+    q = prediction_summary(tmp_path, now_ms=BAR_MS)
+    assert q["relative"]["8h"] == {"scored": 2, "hits": 1, "confident": 2, "confident_hits": 1, "top5": 1, "top5_hits": 1}
+    assert q["relative"]["4h"]["scored"] == 1 and q["relative"]["4h"]["hits"] == 1
+    assert q["scored"] == 0 and q["eight"]["scored"] == 0 and q["latest"][0]["p_above_8h"] == 0.7

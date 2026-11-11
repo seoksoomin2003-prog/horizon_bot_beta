@@ -224,7 +224,8 @@ def prediction_summary(root: Path, now_ms: float) -> dict:
     """The live direction predictor's record (predictor/live.py), scored against what happened next."""
     folder = root / "runtime" / "predictor"
     predicted = read_ledger(folder / "predictions.jsonl")
-    outcomes = {(o.get("symbol"), o.get("close_ms"), o.get("horizon", 1)): o for o in read_ledger(folder / "outcomes.jsonl")}
+    outcomes = {(o.get("symbol"), o.get("close_ms"), o.get("horizon", 1), o.get("kind", "direction")): o
+                for o in read_ledger(folder / "outcomes.jsonl")}
     try:
         status = json.loads((folder / "status.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -232,19 +233,25 @@ def prediction_summary(root: Path, now_ms: float) -> dict:
     running = pid_alive(root / ".run" / "predictor.pid")
     updated = status.get("updated_ms")
     rows, scored, signals, confident = [], [], [], []
-    eight = {"scored": 0, "hits": 0, "confident": 0, "confident_hits": 0, "top5": 0, "top5_hits": 0}    # 8-hour predictions
-    eight_p = {}
+    tally = lambda: {"scored": 0, "hits": 0, "confident": 0, "confident_hits": 0, "top5": 0, "top5_hits": 0}
+    eight, relative = tally(), {"4h": tally(), "8h": tally()}      # 8-hour predictions; "beats the median coin" predictions
+    eight_p, relative_p = {}, {}
     for p in predicted:
-        horizon = p.get("horizon", 1)       # rows from before 8-hour predictions existed are 4-hour ones
-        o = outcomes.get((p.get("symbol"), p.get("close_ms"), horizon))
-        if horizon != 1:
-            eight_p[(p.get("symbol"), p.get("close_ms"))] = p.get("p_up")
-            if o is not None:
-                hit = (p["p_up"] > 0.5) == (o["log_return"] > 0)
+        horizon, kind = p.get("horizon", 1), p.get("kind", "direction")     # older rows are 4-hour direction ones
+        o = outcomes.get((p.get("symbol"), p.get("close_ms"), horizon, kind))
+        if horizon != 1 or kind != "direction":
+            counts = eight if kind == "direction" else relative.get(f"{4 * horizon}h")
+            if counts is None:
+                continue
+            if horizon == 2:
+                (eight_p if kind == "direction" else relative_p)[(p.get("symbol"), p.get("close_ms"))] = p.get("p_up")
+            answer = None if o is None else o.get("relative_return" if kind == "relative" else "log_return")
+            if answer is not None:
+                hit = (p["p_up"] > 0.5) == (answer > 0)
                 for key, counted in (("scored", True), ("confident", p.get("confident")), ("top5", p.get("top5"))):
                     if counted:
-                        eight[key] += 1
-                        eight["hits" if key == "scored" else f"{key}_hits"] += hit
+                        counts[key] += 1
+                        counts["hits" if key == "scored" else f"{key}_hits"] += hit
             continue
         row = {"close_ms": p.get("close_ms"), "symbol": p.get("symbol"), "price": p.get("price"), "p_up": p.get("p_up"),
                "expected_gain": p.get("expected_gain"), "signal": bool(p.get("signal")), "confident": bool(p.get("confident")),
@@ -263,13 +270,14 @@ def prediction_summary(root: Path, now_ms: float) -> dict:
     net = [(1 if r["p_up"] > 0.5 else -1) * (math.exp(ret) - 1) - ROUND_TRIP_COST for r, ret in signals]
     confident_net = [(1 if r["p_up"] > 0.5 else -1) * (math.exp(ret) - 1) - ROUND_TRIP_COST for r, ret in confident]
     latest = sorted((r for r in rows if r["close_ms"] == latest_close), key=lambda r: -abs(r["p_up"] - 0.5))
-    latest = [{**r, "p_up_8h": eight_p.get((r["symbol"], r["close_ms"]))} for r in latest]
+    latest = [{**r, "p_up_8h": eight_p.get((r["symbol"], r["close_ms"])),
+               "p_above_8h": relative_p.get((r["symbol"], r["close_ms"]))} for r in latest]
     return {
         "running": running, "stale": bool(running and updated and now_ms - updated > PREDICTOR_STALE_MS),
         "updated_ms": updated, "ok": status.get("ok"), "message": mask(str(status.get("message", "")))[:200],
         "model_month": status.get("model_month"), "first_ms": rows[0]["close_ms"] if rows else None,
         "latest": latest[:MAX_LATEST_ROWS], "latest_count": len(latest),
-        "collected": status.get("collected"), "eight": eight,
+        "collected": status.get("collected"), "eight": eight, "relative": relative,
         "confident": len(confident), "confident_hits": sum(r["hit"] for r, _ in confident),
         "confident_net": sum(confident_net) / len(confident_net) if confident_net else None,
         "scored": n, "hits": sum(r["hit"] for r, _ in scored), "ups": sum(r["up"] for r, _ in scored),
