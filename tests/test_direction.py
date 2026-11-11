@@ -93,3 +93,30 @@ def test_final_check_period_is_closed_to_flow_development_code():
         h4_data.load_flow("BTCUSDT", end_ms=h4_data.VAL_END_MS + 1)
     with pytest.raises(PermissionError):
         h4_data.download_flow(end_ms=h4_data.VAL_END_MS + 1)
+
+
+def test_external_daily_value_is_used_only_from_the_next_utc_day():
+    from research.direction import DAY_MS, add_external
+    day = T0 // DAY_MS * DAY_MS
+    daily = np.array([[day, 100.0], [day + DAY_MS, 110.0], [day + 2 * DAY_MS, 121.0]])
+    hourly = np.array([[day + h * 3_600_000, 50.0 + h] for h in range(80)])
+    data = pd.DataFrame({"close_ms": [day + DAY_MS + 20 * 3_600_000, day + 2 * DAY_MS, day + 2 * DAY_MS + BAR_MS]})
+    out = add_external(data, {"spx": daily, "vix": daily, "dxy": daily, "dvol": hourly})
+    assert np.isnan(out["spx_r"].iloc[0])                        # only day 0 is known late on day 1, and it has no return yet
+    assert np.isclose(out["spx_r"].iloc[1], np.log(1.1))         # day 1's close is usable from day 2 00:00
+    assert np.isclose(out["vix"].iloc[2], np.log(110.0))         # day 2's own close is still unknown during day 2
+    assert np.isclose(out["dvol"].iloc[1], np.log(50.0 + 47))    # the hour that closed exactly at the bar close
+    assert np.isclose(out["dvol_change"].iloc[2], np.log(50.0 + 51) - np.log(50.0 + 27))
+
+
+def test_transfer_learns_only_from_the_named_coins(monkeypatch):
+    import research.direction as d
+    a, b = frame("A", bars(900, seed=1), FUNDING, None, 1), frame("B", bars(900, seed=2), FUNDING, None, 1)
+    data = pd.concat([a, b], ignore_index=True)
+    sizes = []
+    real_fit = d.fit
+    monkeypatch.setattr(d, "fit", lambda x, y: sizes.append(len(x)) or real_fit(x, y))
+    pred = d.walk_forward(data, 1, T0, int(a["close_ms"].iloc[500]), int(a["close_ms"].iloc[-1]), False, train_symbols={"A"})
+    usable = a.dropna(subset=FEATURES + ["fwd", "sd42"])
+    assert sizes == [int(((usable["close_ms"] + BAR_MS) <= m).sum()) for m in sorted(pred["month"].unique())]
+    assert set(pred["symbol"]) == {"A", "B"} and (pred["thr"] > 0).all()

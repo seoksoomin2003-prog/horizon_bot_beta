@@ -20,6 +20,7 @@ HORIZONS = {"D4": 1, "D24": 6}
 FEATURES = ["r1", "r6", "r42", "r168", "vol", "vol_change", "btc_r1", "btc_r6", "funding", "volume", "range_pos",
             "hour_sin", "hour_cos"]
 FLOW_FEATURES = ["taker_1", "taker_6", "btc_taker_1", "basis", "basis_change"]     # v5
+EXTERNAL_FEATURES = ["spx_r", "vix", "vix_change", "dxy_r", "dvol", "dvol_change"]  # v6
 
 
 def _funding_sum(fts: np.ndarray, cum: np.ndarray, start: np.ndarray, end: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -73,6 +74,28 @@ def frame(symbol: str, bars: np.ndarray, funding: np.ndarray, btc: pd.DataFrame 
     return out.rename_axis("close_ms").reset_index()
 
 
+def add_external(data: pd.DataFrame, external: dict[str, np.ndarray]) -> pd.DataFrame:
+    """Adds the v6 EXTERNAL_FEATURES. A daily close dated D is used from D+1 00:00 UTC; DVOL is the hourly close at the bar close."""
+    out = data.copy()
+    when = out["close_ms"].to_numpy()
+
+    def daily(rows: np.ndarray, values: np.ndarray) -> np.ndarray:
+        i = np.searchsorted(rows[:, 0] + DAY_MS, when, side="right") - 1
+        return np.where(i >= 0, values[np.maximum(i, 0)], np.nan)
+
+    def log_change(rows: np.ndarray) -> np.ndarray:
+        return np.concatenate([[np.nan], np.diff(np.log(rows[:, 1]))])
+
+    out["spx_r"] = daily(external["spx"], log_change(external["spx"]))
+    out["vix"] = daily(external["vix"], np.log(external["vix"][:, 1]))
+    out["vix_change"] = daily(external["vix"], log_change(external["vix"]))
+    out["dxy_r"] = daily(external["dxy"], log_change(external["dxy"]))
+    hourly = pd.Series(np.log(external["dvol"][:, 1]), index=external["dvol"][:, 0].astype(np.int64) + 3_600_000)   # hour close time
+    out["dvol"] = hourly.reindex(when).to_numpy()
+    out["dvol_change"] = out["dvol"] - hourly.reindex(when - 6 * BAR_MS).to_numpy()
+    return out
+
+
 def fit(x: np.ndarray, y: np.ndarray, lam: float = LAMBDA) -> np.ndarray:
     """L2 logistic regression by Newton steps. w[0] is the unpenalized intercept."""
     a = np.hstack([np.ones((len(x), 1)), x])
@@ -101,10 +124,13 @@ def month_starts(start_ms: int, end_ms: int) -> list[int]:
 
 
 def walk_forward(data: pd.DataFrame, horizon: int, train_start_ms: int, score_start_ms: int, end_ms: int,
-                 daily_only: bool, features: list[str] = FEATURES, require: list[str] = ()) -> pd.DataFrame:
+                 daily_only: bool, features: list[str] = FEATURES, require: list[str] = (),
+                 train_symbols: set[str] | None = None) -> pd.DataFrame:
     """Refits on the first of every month on rows whose answer is already known, and predicts that month.
 
     Rows missing any of `require` are dropped too, so two feature sets can be compared on the same rows.
+    With `train_symbols` only those coins are learned from; every coin is still predicted (v6 transfer test).
+    `thr` is the 90th percentile of |p - 0.5| on the training rows: the v6 "top 10% confidence" cutoff for that month.
     """
     data = data.dropna(subset=list(features) + list(require) + ["fwd", "sd42"])
     data = data[(data["close_ms"] >= train_start_ms) & (data["close_ms"] + horizon * BAR_MS <= end_ms)]
@@ -112,10 +138,11 @@ def walk_forward(data: pd.DataFrame, horizon: int, train_start_ms: int, score_st
     x_all = data[features].to_numpy(float)
     known = (data["close_ms"] + horizon * BAR_MS).to_numpy()
     when = data["close_ms"].to_numpy()
+    learnable = np.ones(len(data), bool) if train_symbols is None else data["symbol"].isin(train_symbols).to_numpy()
     starts = month_starts(score_start_ms, end_ms)
     parts = []
     for m, nxt in zip(starts, starts[1:] + [end_ms]):
-        train = known <= m
+        train = (known <= m) & learnable
         test = (when >= m) & (when < nxt)
         if daily_only:
             test &= when % DAY_MS == 0
@@ -128,6 +155,7 @@ def walk_forward(data: pd.DataFrame, horizon: int, train_start_ms: int, score_st
         part = data[test].copy()
         part["p"] = predict(w, scale(x_all[test]))
         part["base"] = y_all[train].mean()
+        part["thr"] = np.quantile(np.abs(predict(w, scale(x_all[train])) - 0.5), 0.9)
         part["month"] = m
         parts.append(part)
     out = pd.concat(parts, ignore_index=True)

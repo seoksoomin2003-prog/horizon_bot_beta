@@ -126,3 +126,95 @@ def load_flow(symbol: str, end_ms: int = VAL_END_MS, data_dir: Path = FLOW_DIR) 
     _flow_guard(end_ms)
     rows = np.load(data_dir / f"{symbol}.flow.npy")
     return rows[rows[:, 0] < end_ms]
+
+
+V6_DIR = DATA_DIR / "v6"
+V6_SYMBOLS_FILE = DATA_DIR / "v6_symbols.json"
+EXTERNAL_DIR = DATA_DIR / "external"
+STABLE_BASES = {"USDC", "FDUSD", "TUSD", "BUSD"}
+
+
+def choose_v6_symbols(count: int = 50) -> list[str]:
+    """Picks and saves the v6 coins once: perpetuals listed before 2023, largest 24h turnover today, not the original 10."""
+    import json
+    if V6_SYMBOLS_FILE.exists():
+        return json.loads(V6_SYMBOLS_FILE.read_text())["symbols"]
+    from replay.market_data import _keyless_client
+    client = _keyless_client()
+    listed = {s["symbol"] for s in client.fapiPublicGetExchangeInfo()["symbols"]
+              if s["contractType"] == "PERPETUAL" and s["quoteAsset"] == "USDT" and s["status"] == "TRADING"
+              and int(s["onboardDate"]) < utc_ms("2023-01-01") and s["baseAsset"] not in STABLE_BASES} - set(SYMBOLS)
+    turnover = {t["symbol"]: float(t["quoteVolume"]) for t in client.fapiPublicGetTicker24hr() if t["symbol"] in listed}
+    symbols = sorted(turnover, key=turnover.get, reverse=True)[:count]
+    V6_SYMBOLS_FILE.write_text(json.dumps({"chosen": time.strftime("%FT%TZ", time.gmtime()), "symbols": symbols}))
+    return symbols
+
+
+def download_v6() -> None:
+    _download_raw(choose_v6_symbols(), V6_DIR, WARMUP_START_MS, VAL_END_MS)
+
+
+def _download_raw(symbols: list[str], data_dir: Path, start_ms: int, end_ms: int) -> None:
+    """Like _download, by exchange symbol name (1000PEPEUSDT and the like have no simple ccxt name)."""
+    from replay.market_data import _keyless_client
+    data_dir.mkdir(parents=True, exist_ok=True)
+    client = _keyless_client()
+    for symbol in symbols:
+        if (data_dir / f"{symbol}.funding.npy").exists():
+            continue
+        bars = _pages(lambda c: [[int(r[0])] + [float(v) for v in r[1:6]] for r in
+                                 client.fapiPublicGetKlines({"symbol": symbol, "interval": "4h", "startTime": c, "limit": 1500})],
+                      start_ms, end_ms)
+        funding = _pages(lambda c: [[int(r["fundingTime"]), float(r["fundingRate"])] for r in
+                                    client.fapiPublicGetFundingRate({"symbol": symbol, "startTime": c, "limit": 1000})],
+                         start_ms, end_ms)
+        bars = np.array(bars, dtype=float)
+        bars = bars[np.unique(bars[:, 0], return_index=True)[1]]
+        funding = np.array(funding, dtype=float).reshape(-1, 2)
+        funding = funding[np.unique(funding[:, 0], return_index=True)[1]]
+        np.save(data_dir / f"{symbol}.bars.npy", bars)
+        np.save(data_dir / f"{symbol}.funding.npy", funding)
+        print(f"{symbol}: {len(bars)} bars from {time.strftime('%F', time.gmtime(bars[0, 0] / 1000))}, {len(funding)} funding rates", flush=True)
+
+
+def load_v6(symbol: str) -> tuple[np.ndarray, np.ndarray]:
+    bars, funding = np.load(V6_DIR / f"{symbol}.bars.npy"), np.load(V6_DIR / f"{symbol}.funding.npy")
+    return bars[bars[:, 0] < VAL_END_MS], funding[funding[:, 0] < VAL_END_MS]
+
+
+def download_external(end_ms: int = VAL_END_MS) -> None:
+    """Daily S&P 500, VIX and dollar index closes (Yahoo chart API) and hourly Deribit BTC DVOL, as [time_ms, close]."""
+    import json
+    import urllib.request
+    _flow_guard(end_ms)
+    EXTERNAL_DIR.mkdir(parents=True, exist_ok=True)
+
+    def get(url: str) -> dict:
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 research-script"})
+        return json.loads(urllib.request.urlopen(request, timeout=30).read())
+
+    for name, ticker in (("spx", "%5EGSPC"), ("vix", "%5EVIX"), ("dxy", "DX-Y.NYB")):
+        result = get(f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1={WARMUP_START_MS // 1000}"
+                     f"&period2={end_ms // 1000}&interval=1d")["chart"]["result"][0]
+        rows = [[t * 1000 // 86_400_000 * 86_400_000, c] for t, c in zip(result["timestamp"], result["indicators"]["quote"][0]["close"])
+                if c is not None and t * 1000 < end_ms]
+        np.save(EXTERNAL_DIR / f"{name}.npy", np.array(rows, dtype=float))
+        print(f"{name}: {len(rows)} daily closes", flush=True)
+    rows, cursor = [], end_ms
+    while cursor > utc_ms("2021-03-01"):
+        page = get("https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC"
+                   f"&start_timestamp={utc_ms('2021-03-01')}&end_timestamp={cursor - 1}&resolution=3600")["result"]["data"]
+        if not page:
+            break
+        rows.extend([int(r[0]), float(r[4])] for r in page)
+        cursor = int(page[0][0])
+        time.sleep(0.2)
+    dvol = np.array(rows, dtype=float)
+    dvol = dvol[np.unique(dvol[:, 0], return_index=True)[1]]
+    np.save(EXTERNAL_DIR / "dvol.npy", dvol[dvol[:, 0] < end_ms])
+    print(f"dvol: {len(dvol)} hourly closes from {time.strftime('%F', time.gmtime(dvol[0, 0] / 1000))}", flush=True)
+
+
+def load_external() -> dict[str, np.ndarray]:
+    out = {name: np.load(EXTERNAL_DIR / f"{name}.npy") for name in ("spx", "vix", "dxy", "dvol")}
+    return {name: rows[rows[:, 0] < VAL_END_MS] for name, rows in out.items()}
