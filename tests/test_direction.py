@@ -208,3 +208,18 @@ def test_basket_caps_each_trade_at_a_tenth_and_the_total_at_everything():
     many = pd.DataFrame({"close_ms": [2] * 40, "net": [0.01] * 40})
     r = basket_returns(pd.concat([few, many]), "net")
     assert np.isclose(r[1], 0.002) and np.isclose(r[2], 0.01)                    # 3 trades at 10% each; 40 trades share 100%
+
+
+def test_relative_target_is_measured_against_the_reference_coins_only():
+    from research.direction import add_relative
+    data = pd.DataFrame({"symbol": ["A", "B", "C", "NEW"] * 2, "close_ms": [1] * 4 + [2] * 4,
+                         "r1": [0.01, 0.03, -0.02, 0.50, 0.0, 0.0, 0.0, 0.0], "r6": [0.0] * 8,
+                         "fwd": [0.02, -0.01, 0.00, 0.30, 0.01, 0.02, 0.03, -0.9]})
+    out = add_relative(data, {"A", "B", "C"})
+    first = out[out["close_ms"] == 1].set_index("symbol")
+    assert np.allclose(first["xs_r1"], [0.0, 0.02, -0.03, 0.49])                  # NEW's 0.50 does not move the median (0.01)
+    assert np.allclose(first["fwd"], [0.02, -0.01, 0.0, 0.30]) and np.allclose(first["fwd_abs"], [0.02, -0.01, 0.0, 0.30])   # median fwd is 0
+    assert np.isclose(out[(out["close_ms"] == 2) & (out["symbol"] == "NEW")]["fwd"].iloc[0], -0.92)
+    later = data.copy()
+    later.loc[later["close_ms"] == 2, "r1"] = 9.0                                 # a later bar never changes an earlier feature
+    assert np.allclose(add_relative(later, {"A", "B", "C"}).loc[:3, "xs_r1"], out.loc[:3, "xs_r1"])

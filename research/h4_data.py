@@ -136,17 +136,21 @@ STABLE_BASES = {"USDC", "FDUSD", "TUSD", "BUSD"}
 
 def choose_v6_symbols(count: int = 50) -> list[str]:
     """Picks and saves the v6 coins once: perpetuals listed before 2023, largest 24h turnover today, not the original 10."""
+    return _choose(V6_SYMBOLS_FILE, set(SYMBOLS), count)
+
+
+def _choose(file: Path, exclude: set[str], count: int) -> list[str]:
     import json
-    if V6_SYMBOLS_FILE.exists():
-        return json.loads(V6_SYMBOLS_FILE.read_text())["symbols"]
+    if file.exists():
+        return json.loads(file.read_text())["symbols"]
     from replay.market_data import _keyless_client
     client = _keyless_client()
     listed = {s["symbol"] for s in client.fapiPublicGetExchangeInfo()["symbols"]
               if s["contractType"] == "PERPETUAL" and s["quoteAsset"] == "USDT" and s["status"] == "TRADING"
-              and int(s["onboardDate"]) < utc_ms("2023-01-01") and s["baseAsset"] not in STABLE_BASES} - set(SYMBOLS)
+              and int(s["onboardDate"]) < utc_ms("2023-01-01") and s["baseAsset"] not in STABLE_BASES} - exclude
     turnover = {t["symbol"]: float(t["quoteVolume"]) for t in client.fapiPublicGetTicker24hr() if t["symbol"] in listed}
     symbols = sorted(turnover, key=turnover.get, reverse=True)[:count]
-    V6_SYMBOLS_FILE.write_text(json.dumps({"chosen": time.strftime("%FT%TZ", time.gmtime()), "symbols": symbols}))
+    file.write_text(json.dumps({"chosen": time.strftime("%FT%TZ", time.gmtime()), "symbols": symbols}))
     return symbols
 
 
@@ -317,3 +321,21 @@ def load_m5(symbol: str) -> np.ndarray:
 def load_metrics(symbol: str) -> np.ndarray:
     rows = np.load(METRICS_DIR / f"{symbol}.npy")
     return rows[rows[:, 0] < VAL_END_MS]
+
+
+V9_DIR = DATA_DIR / "v9"
+V9_SYMBOLS_FILE = DATA_DIR / "v9_symbols.json"
+
+
+def choose_v9_symbols(count: int = 50) -> list[str]:
+    """The v9 coins, picked and saved once: the same rule as v6, without the 60 coins already used."""
+    return _choose(V9_SYMBOLS_FILE, set(SYMBOLS) | set(choose_v6_symbols()), count)
+
+
+def download_v9() -> None:
+    _download_raw(choose_v9_symbols(), V9_DIR, WARMUP_START_MS, VAL_END_MS)
+
+
+def load_v9(symbol: str) -> tuple[np.ndarray, np.ndarray]:
+    bars, funding = np.load(V9_DIR / f"{symbol}.bars.npy"), np.load(V9_DIR / f"{symbol}.funding.npy")
+    return bars[bars[:, 0] < VAL_END_MS], funding[funding[:, 0] < VAL_END_MS]

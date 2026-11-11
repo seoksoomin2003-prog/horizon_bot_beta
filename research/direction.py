@@ -1,6 +1,6 @@
 """Direction model for docs/research/direction_preregistration_v3.md (v4: fixed bet threshold, v5: order-flow and basis
 features, v6: external features and transfer, v7: limit-order fills, positioning and market-relative features,
-v8: stricter fills and per-decision-time baskets).
+v8: stricter fills and per-decision-time baskets, v9: direction relative to the median coin).
 Parameters are fixed in those documents; do not tune."""
 
 from __future__ import annotations
@@ -138,6 +138,19 @@ def add_market(data: pd.DataFrame) -> pd.DataFrame:
     out = data.copy()
     for k in ("r1", "r6"):
         out[f"xs_{k}"] = out[k] - out.groupby("close_ms")[k].transform("median")
+    return out
+
+
+def add_relative(data: pd.DataFrame, reference: set[str]) -> pd.DataFrame:
+    """v9: the question becomes "will this coin beat the median reference coin?". `fwd` turns into the forward return
+    minus the reference coins' median forward return at that close (the plain one stays in `fwd_abs`), and the
+    MARKET_FEATURES are measured against the same coins. A coin outside `reference` never moves the median."""
+    out = data.copy()
+    ref = out[out["symbol"].isin(reference)]
+    median = lambda column: out["close_ms"].map(ref.groupby("close_ms")[column].median())
+    out["xs_r1"], out["xs_r6"] = out["r1"] - median("r1"), out["r6"] - median("r6")
+    out["fwd_abs"] = out["fwd"]
+    out["fwd"] = out["fwd"] - median("fwd")
     return out
 
 
