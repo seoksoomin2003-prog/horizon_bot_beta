@@ -17,7 +17,7 @@ class FakeMarket:
 
     def __init__(self, last_close: int, n: int = 400):
         rng = np.random.default_rng(3)
-        self.bars, self.funding = {}, {}
+        self.bars, self.funding, self.symbols = {}, {}, list(SYMBOLS)
         opens = last_close - BAR_MS * np.arange(n, 0, -1)
         for s in SYMBOLS:
             close = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, n)))
@@ -43,6 +43,7 @@ def test_predicts_every_coin_once_on_time(tmp_path, monkeypatch):
     rows = live.read_jsonl(tmp_path / "predictions.jsonl")
     assert {r["symbol"] for r in rows} == set(SYMBOLS) and {r["close_ms"] for r in rows} == {close}
     assert all(0 < r["p_up"] < 1 and r["signal"] == (r["expected_gain"] > 0.005) for r in rows)
+    assert all(isinstance(r["confident"], bool) for r in rows)
     btc = next(r for r in rows if r["symbol"] == "BTCUSDT")
     assert math.isclose(btc["price"], market.bars["BTCUSDT"][-1, 4])
     assert run_cycle(tmp_path, market, close + 120_000, close + 130_000) == "already predicted"
@@ -82,6 +83,10 @@ def test_model_trains_only_on_answers_known_before_the_month(monkeypatch):
     model.refit_if_needed(data, now)
     usable = data.dropna(subset=live.FEATURES + ["fwd", "sd42"])
     assert model.month == month and model.train_rows == int((usable["close_ms"] + BAR_MS <= month).sum())
+    extra = data[data["symbol"] == "BTCUSDT"].assign(symbol="NEWCOIN")      # a coin outside the original 10 is not learned from
+    wider = live.Model()
+    wider.refit_if_needed(pd.concat([data, extra], ignore_index=True), now)
+    assert wider.train_rows == model.train_rows and 0 < wider.thr < 0.5
 
 
 def write(path, rows):
@@ -92,7 +97,7 @@ def test_dashboard_scores_predictions(tmp_path):
     folder = tmp_path / "runtime/predictor"
     folder.mkdir(parents=True)
     write(folder / "predictions.jsonl", [
-        {"close_ms": 0, "symbol": "BTCUSDT", "price": 100.0, "p_up": 0.6, "expected_gain": 0.006, "signal": True},
+        {"close_ms": 0, "symbol": "BTCUSDT", "price": 100.0, "p_up": 0.6, "expected_gain": 0.006, "signal": True, "confident": True},
         {"close_ms": 0, "symbol": "ETHUSDT", "price": 10.0, "p_up": 0.45, "expected_gain": 0.001, "signal": False},
         {"close_ms": BAR_MS, "symbol": "BTCUSDT", "price": 101.0, "p_up": 0.55, "expected_gain": 0.002, "signal": False}])
     write(folder / "outcomes.jsonl", [
@@ -101,6 +106,7 @@ def test_dashboard_scores_predictions(tmp_path):
     q = prediction_summary(tmp_path, now_ms=BAR_MS)
     assert (q["scored"], q["hits"], q["ups"], q["signals"], q["signal_hits"]) == (2, 1, 2, 1, 1)
     assert math.isclose(q["signal_net"], 0.01 - 0.002)
+    assert (q["confident"], q["confident_hits"]) == (1, 1) and math.isclose(q["confident_net"], 0.01 - 0.002)
     assert [r["symbol"] for r in q["latest"]] == ["BTCUSDT"] and q["latest"][0]["hit"] is None
     assert not q["running"]
 
@@ -121,3 +127,46 @@ def test_predictor_never_imports_the_bot_config():
     code = "import sys, predictor.live; print('config' in sys.modules or 'data_handler' in sys.modules)"
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=live.ROOT)
     assert out.stdout.strip() == "False", out.stderr
+
+
+def test_collector_saves_each_completed_hour_once(tmp_path):
+    from predictor.collect import HOUR_MS, Collector, last_times
+    now = 1_000 * HOUR_MS
+
+    class Client:
+        calls = 0
+
+        def _rows(self, q, **fields):
+            Client.calls += 1
+            return [{"timestamp": t, **fields} for t in range(max(q["startTime"] // HOUR_MS + 1, 990) * HOUR_MS, now + 1, HOUR_MS)
+                    if q["startTime"] <= t <= q["endTime"]][-500:]
+
+        def fapiDataGetOpenInterestHist(self, q):
+            return self._rows(q, sumOpenInterest="5", sumOpenInterestValue="500")
+
+        def fapiDataGetGlobalLongShortAccountRatio(self, q):
+            return self._rows(q, longAccount="0.6")
+
+        def fapiDataGetTopLongShortPositionRatio(self, q):
+            return self._rows(q, longAccount="0.7")
+
+    c = Collector(tmp_path, Client(), ["BTCUSDT"], pause=0)
+    assert c.positioning(now) == 10          # hours 990..999; the hour still forming (1000) is left out
+    assert c.positioning(now) == 0
+    rows = live.read_jsonl(tmp_path / "positioning.jsonl")
+    assert rows[-1] == {"ts": 999 * HOUR_MS, "symbol": "BTCUSDT", "oi": 5.0, "oi_value": 500.0, "long_accounts": 0.6,
+                        "top_long_positions": 0.7}
+    assert last_times(tmp_path / "positioning.jsonl") == {"BTCUSDT": 999 * HOUR_MS}
+    assert Collector(tmp_path, Client(), ["BTCUSDT"], pause=0).positioning(now + HOUR_MS) == 1     # a restart continues
+
+
+def test_order_book_imbalance_and_liquidation_rows():
+    from predictor.collect import book_row, liquidation_row
+    row = book_row("X", 1, [["100", "3"], ["99", "1"]], [["101", "1"], ["102", "1"]])
+    assert math.isclose(row["mid"], 100.5) and math.isclose(row["spread"], 1 / 100.5)
+    assert math.isclose(row["imbalance_20"], (399 - 203) / (399 + 203))
+    assert book_row("X", 1, [], [["1", "1"]]) is None
+    message = {"e": "forceOrder", "o": {"s": "BTCUSDT", "S": "SELL", "ap": "50000", "z": "0.2", "T": 123}}
+    assert liquidation_row(message, {"BTCUSDT"}) == {"ts": 123, "symbol": "BTCUSDT", "side": "SELL", "value": 10000.0}
+    assert liquidation_row({"stream": "!forceOrder@arr", "data": message}, {"BTCUSDT"})["value"] == 10000.0
+    assert liquidation_row(message, {"ETHUSDT"}) is None and liquidation_row({"o": {"s": "BTCUSDT"}}, {"BTCUSDT"}) is None

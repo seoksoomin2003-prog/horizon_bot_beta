@@ -48,6 +48,7 @@ BAR_MS = 4 * 3_600_000
 PREDICTOR_STALE_MS = BAR_MS + 20 * 60_000
 ROUND_TRIP_COST = 0.002     # the research cost: 0.10% per side
 MAX_PREDICTION_ROWS = 60
+MAX_LATEST_ROWS = 15
 
 
 def mask(text: str) -> str:
@@ -230,26 +231,34 @@ def prediction_summary(root: Path, now_ms: float) -> dict:
         status = {}
     running = pid_alive(root / ".run" / "predictor.pid")
     updated = status.get("updated_ms")
-    rows, scored, signals = [], [], []
+    rows, scored, signals, confident = [], [], [], []
     for p in predicted:
         o = outcomes.get((p.get("symbol"), p.get("close_ms")))
         row = {"close_ms": p.get("close_ms"), "symbol": p.get("symbol"), "price": p.get("price"), "p_up": p.get("p_up"),
-               "expected_gain": p.get("expected_gain"), "signal": bool(p.get("signal")), "next_price": None, "up": None, "hit": None}
+               "expected_gain": p.get("expected_gain"), "signal": bool(p.get("signal")), "confident": bool(p.get("confident")),
+               "next_price": None, "up": None, "hit": None}
         if o is not None:
             up = o["log_return"] > 0
             row.update(next_price=o.get("next_price"), up=up, hit=(p["p_up"] > 0.5) == up)
             scored.append((row, o["log_return"]))
             if row["signal"]:
                 signals.append((row, o["log_return"]))
+            if row["confident"]:
+                confident.append((row, o["log_return"]))
         rows.append(row)
     latest_close = max((r["close_ms"] for r in rows), default=None)
     n = len(scored)
     net = [(1 if r["p_up"] > 0.5 else -1) * (math.exp(ret) - 1) - ROUND_TRIP_COST for r, ret in signals]
+    confident_net = [(1 if r["p_up"] > 0.5 else -1) * (math.exp(ret) - 1) - ROUND_TRIP_COST for r, ret in confident]
+    latest = sorted((r for r in rows if r["close_ms"] == latest_close), key=lambda r: -abs(r["p_up"] - 0.5))
     return {
         "running": running, "stale": bool(running and updated and now_ms - updated > PREDICTOR_STALE_MS),
         "updated_ms": updated, "ok": status.get("ok"), "message": mask(str(status.get("message", "")))[:200],
         "model_month": status.get("model_month"), "first_ms": rows[0]["close_ms"] if rows else None,
-        "latest": sorted((r for r in rows if r["close_ms"] == latest_close), key=lambda r: -abs(r["p_up"] - 0.5)),
+        "latest": latest[:MAX_LATEST_ROWS], "latest_count": len(latest),
+        "collected": status.get("collected"),
+        "confident": len(confident), "confident_hits": sum(r["hit"] for r, _ in confident),
+        "confident_net": sum(confident_net) / len(confident_net) if confident_net else None,
         "scored": n, "hits": sum(r["hit"] for r, _ in scored), "ups": sum(r["up"] for r, _ in scored),
         "signals": len(signals), "signal_hits": sum(r["hit"] for r, _ in signals),
         "signal_net": sum(net) / len(net) if net else None,

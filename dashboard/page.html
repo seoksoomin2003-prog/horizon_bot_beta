@@ -97,13 +97,13 @@ button:disabled { opacity: .5; cursor: default; }
       <div><dt>채점된 예측</dt><dd id="predscored">-</dd></div>
       <div><dt>모델 적중률</dt><dd id="predhit">-</dd></div>
       <div><dt>"항상 오른다" 적중률</dt><dd id="predup">-</dd></div>
-      <div><dt>강한 신호 적중률</dt><dd id="predsig">-</dd></div>
-      <div><dt>강한 신호 평균 손익 (비용 0.2% 차감)</dt><dd id="predsignet">-</dd></div>
+      <div><dt>확신 상위 10% 적중률</dt><dd id="predsig">-</dd></div>
+      <div><dt>확신 상위 10% 건당 손익 (비용 0.2% 차감)</dt><dd id="predsignet">-</dd></div>
     </dl>
     <p class="label" id="prednote"></p>
     <h2 class="spaced">최근 예측 <span class="label" id="predlatest"></span></h2>
     <div class="scroll"><table>
-      <thead><tr><th>코인</th><th class="num">가격</th><th class="num">상승 확률</th><th>예측</th><th class="num">예상 이익</th><th>강한 신호</th></tr></thead>
+      <thead><tr><th>코인</th><th class="num">가격</th><th class="num">상승 확률</th><th>예측</th><th class="num">예상 이익</th><th>확신 상위 10%</th></tr></thead>
       <tbody id="predrows"></tbody>
     </table></div>
     <h2 class="spaced">채점 기록 <span class="label">최근 60건</span></h2>
@@ -294,14 +294,15 @@ function renderPredictions(q) {
   $("predscored").textContent = `${q.scored}건`;
   $("predhit").textContent = ratio(q.hits, q.scored);
   $("predup").textContent = ratio(q.ups, q.scored);
-  $("predsig").textContent = ratio(q.signal_hits, q.signals);
-  $("predsignet").textContent = q.signal_net == null ? "없음" : (q.signal_net > 0 ? "+" : "") + pct(q.signal_net);
+  $("predsig").textContent = ratio(q.confident_hits, q.confident);
+  $("predsignet").textContent = q.confident_net == null ? "없음" : (q.confident_net > 0 ? "+" : "") + pct(q.confident_net);
   const margin = q.scored ? 1.96 * Math.sqrt(0.25 / q.scored) : null;
   $("prednote").textContent = (margin == null ? "아직 채점된 예측이 없습니다. " : `지금 표본으로는 적중률이 우연만으로도 약 ±${(margin * 100).toFixed(1)}%p 흔들립니다. `)
-    + "연구에서 이 모델의 적중률은 약 52%였고, 검증 구간에서는 우위가 확인되지 않았습니다. 강한 신호는 예상 이익이 0.5%를 넘는 경우로 드물게 나옵니다.";
-  $("predlatest").textContent = q.latest.length ? `${when(q.latest[0].close_ms)} 마감 기준` : "";
+    + "연구에서 이 모델은 처음 보는 코인 50개에서 적중률 52.0%, 확신 상위 10%에서 54.7%였습니다. 다만 비용을 빼면 수익이 확인되지 않았습니다."
+    + (q.collected ? ` 이번 실행에서 수집한 연구용 데이터: 미결제약정·롱숏 비율 ${q.collected.positioning}행, 호가 ${q.collected.orderbook}행, 강제청산 ${q.collected.liquidations}건.` : "");
+  $("predlatest").textContent = q.latest.length ? `${when(q.latest[0].close_ms)} 마감 기준 · 코인 ${q.latest_count}개 중 확신이 큰 ${q.latest.length}개` : "";
   fillRows("predrows", q.latest.map((r) => row([[sym(r.symbol)], [price(r.price), 1], [pct(r.p_up, 1), 1], [dirText(r.p_up)],
-    [pct(r.expected_gain), 1], [r.signal ? "예" : ""]])), "아직 예측이 없습니다. 켜면 다음 4시간봉 마감(한국 시각 1·5·9·13·17·21시) 때 나옵니다.", 6);
+    [pct(r.expected_gain), 1], [r.confident ? "예" : ""]])), "아직 예측이 없습니다. 켜면 다음 4시간봉 마감(한국 시각 1·5·9·13·17·21시) 때 나옵니다.", 6);
   fillRows("predscoredrows", q.recent.map((r) => row([[when(r.close_ms)], [sym(r.symbol)], [pct(r.p_up, 1), 1], [dirText(r.p_up)],
     [r.up ? "오름" : "내림"], [price(r.next_price), 1], [r.hit ? "맞음" : "틀림"]])), "아직 채점된 예측이 없습니다.", 7);
 }

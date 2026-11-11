@@ -1,7 +1,10 @@
 """Live direction predictions. No orders, no keys: public prices only.
 
-Every 4-hour bar close it records, for each of the 10 coins, the v3 model's probability that the next 4 hours close
-higher (the D4 candidate; docs/research/direction_result_v4.md). One bar later it records what happened. The dashboard
+It also collects data the exchange does not keep (predictor/collect.py) for later research.
+
+Every 4-hour bar close it records, for each coin, the v3 model's probability that the next 4 hours close higher (the
+D4 candidate), and marks the "confident" ones: the top 10% by the model's own training-time measure, which hit about
+55% on coins the model never saw (docs/research/direction_result_v6.md). One bar later it records what happened. The dashboard
 reads both files and keeps score. A prediction is only recorded within MAX_LATE_MS of the close, so a laptop that slept
 through a close skips it instead of predicting after the fact.
 
@@ -25,7 +28,8 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from research.direction import ABS_MOVE, CLIP, FEATURES, fit, frame, predict  # noqa: E402
-from research.h4_data import BAR_MS, DEV_START_MS, SYMBOLS, WARMUP_START_MS, _pages  # noqa: E402
+from research.h4_data import BAR_MS, DEV_START_MS, SYMBOLS, V6_DIR, V6_SYMBOLS_FILE, WARMUP_START_MS, _pages  # noqa: E402
+from predictor.collect import Collector  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 DIR = ROOT / "runtime" / "predictor"
@@ -63,51 +67,53 @@ def write_status(directory: Path, **fields) -> None:
 class Market:
     """Completed 4h bars and funding rates for every coin, cached on disk and topped up from the exchange."""
 
-    def __init__(self, directory: Path, client) -> None:
-        self.dir, self.client = directory, client
+    def __init__(self, directory: Path, client, symbols: list[str] = SYMBOLS) -> None:
+        self.dir, self.client, self.symbols = directory, client, list(symbols)
         self.bars: dict[str, np.ndarray] = {}
         self.funding: dict[str, np.ndarray] = {}
 
     def _load(self, name: str, width: int) -> np.ndarray:
-        try:
-            return np.load(self.dir / name)
-        except OSError:
-            return np.empty((0, width))
+        for folder in (self.dir, V6_DIR):       # the research download saves a first-run fetch of six years
+            try:
+                return np.load(folder / name)
+            except OSError:
+                continue
+        return np.empty((0, width))
+
+    def _top_up(self, name: str, rows: np.ndarray, fetch, now_ms: int, complete) -> np.ndarray:
+        since = int(rows[-1, 0]) + 1 if len(rows) else WARMUP_START_MS
+        new = [r for r in _pages(fetch, since, now_ms) if complete(r)]
+        if new or not (self.dir / name).exists():
+            rows = np.vstack([rows, np.array(new, dtype=float).reshape(-1, rows.shape[1])])
+            rows = rows[np.unique(rows[:, 0], return_index=True)[1]]
+            np.save(self.dir / name, rows)
+        return rows
 
     def update(self, now_ms: int) -> None:
-        from replay.market_data import _market
-        for symbol in SYMBOLS:
-            bars = self.bars.get(symbol)
-            if bars is None:
-                bars = self._load(f"{symbol}.bars.npy", 6)
+        for symbol in self.symbols:
+            if symbol not in self.bars:
+                self.bars[symbol] = self._load(f"{symbol}.bars.npy", 6)
                 self.funding[symbol] = self._load(f"{symbol}.funding.npy", 2)
-            market = _market(symbol)
-            since = int(bars[-1, 0]) + 1 if len(bars) else WARMUP_START_MS
-            new = _pages(lambda c: self.client.fetch_ohlcv(market, "4h", since=c, limit=1500), since, now_ms)
-            new = [r for r in new if r[0] + BAR_MS <= now_ms]       # completed bars only
-            if new:
-                bars = np.vstack([bars, np.array(new, dtype=float)])
-                bars = bars[np.unique(bars[:, 0], return_index=True)[1]]
-                np.save(self.dir / f"{symbol}.bars.npy", bars)
-            self.bars[symbol] = bars
-            funding = self.funding[symbol]
-            since = int(funding[-1, 0]) + 1 if len(funding) else WARMUP_START_MS
-            new = _pages(lambda c: [[int(p["timestamp"]), float(p["fundingRate"])]
-                                    for p in self.client.fetch_funding_rate_history(market, since=c, limit=1000)], since, now_ms)
-            if new:
-                funding = np.vstack([funding, np.array(new, dtype=float)])
-                funding = funding[np.unique(funding[:, 0], return_index=True)[1]]
-                np.save(self.dir / f"{symbol}.funding.npy", funding)
-            self.funding[symbol] = funding
+            klines = lambda c: [[int(r[0])] + [float(v) for v in r[1:6]] for r in
+                                self.client.fapiPublicGetKlines({"symbol": symbol, "interval": "4h", "startTime": c, "limit": 1500})]
+            rates = lambda c: [[int(r["fundingTime"]), float(r["fundingRate"])] for r in
+                               self.client.fapiPublicGetFundingRate({"symbol": symbol, "startTime": c, "limit": 1000})]
+            self.bars[symbol] = self._top_up(f"{symbol}.bars.npy", self.bars[symbol], klines, now_ms,
+                                             lambda r: r[0] + BAR_MS <= now_ms)       # completed bars only
+            self.funding[symbol] = self._top_up(f"{symbol}.funding.npy", self.funding[symbol], rates, now_ms, lambda r: True)
 
     def frames(self) -> pd.DataFrame:
         btc = frame("BTCUSDT", self.bars["BTCUSDT"], self.funding["BTCUSDT"], None, 1).set_index("close_ms")[["r1", "r6"]]
-        return pd.concat([frame(s, self.bars[s], self.funding[s], None if s == "BTCUSDT" else btc, 1) for s in SYMBOLS],
+        return pd.concat([frame(s, self.bars[s], self.funding[s], None if s == "BTCUSDT" else btc, 1) for s in self.symbols],
                          ignore_index=True)
 
 
 class Model:
-    """The research model refit monthly: standardize on the training rows, clip, L2 logistic regression."""
+    """The research model refit monthly: standardize on the training rows, clip, L2 logistic regression.
+
+    It learns from the original 10 coins only, also when it predicts more (v6: learning from 60 did not help), and
+    keeps `thr`, the 90th percentile of |p - 0.5| on its training rows: predictions at or above it are "confident".
+    """
 
     def __init__(self) -> None:
         self.month: int | None = None
@@ -116,12 +122,13 @@ class Model:
         month = int(pd.Timestamp(now_ms, unit="ms").to_period("M").start_time.value // 1_000_000)
         if month == self.month:
             return
-        rows = data.dropna(subset=FEATURES + ["fwd", "sd42"])
+        rows = data[data["symbol"].isin(SYMBOLS)].dropna(subset=FEATURES + ["fwd", "sd42"])
         rows = rows[(rows["close_ms"] >= DEV_START_MS) & (rows["close_ms"] + BAR_MS <= month)]
         x = rows[FEATURES].to_numpy(float)
         self.mean, self.std = x.mean(axis=0), x.std(axis=0)
         self.std[self.std == 0] = 1.0
         self.w = fit(self._scale(x), (rows["fwd"] > 0).to_numpy(float))
+        self.thr = float(np.quantile(np.abs(predict(self.w, self._scale(x)) - 0.5), 0.9))
         self.month, self.train_rows = month, len(rows)
 
     def _scale(self, x: np.ndarray) -> np.ndarray:
@@ -131,13 +138,13 @@ class Model:
         return predict(self.w, self._scale(rows[FEATURES].to_numpy(float)))
 
 
-def predictions_for(rows: pd.DataFrame, p: np.ndarray, close_ms: int, model_month: int, made_ms: int) -> list[dict]:
+def predictions_for(rows: pd.DataFrame, p: np.ndarray, close_ms: int, model: Model, made_ms: int) -> list[dict]:
     out = []
     for (_, r), prob in zip(rows.iterrows(), p):
         gain = abs(2 * prob - 1) * r["sd42"] * ABS_MOVE
         out.append({"close_ms": close_ms, "symbol": r["symbol"], "price": float(math.exp(r["logc"])), "p_up": float(prob),
-                    "expected_gain": float(gain), "signal": bool(gain > SIGNAL_GAIN), "model_month": model_month,
-                    "made_ms": made_ms})
+                    "expected_gain": float(gain), "signal": bool(gain > SIGNAL_GAIN),
+                    "confident": bool(abs(prob - 0.5) >= model.thr), "model_month": model.month, "made_ms": made_ms})
     return out
 
 
@@ -179,20 +186,33 @@ def cycle(market: Market, model: Model, directory: Path, now_ms: int, clock=time
     made = int(clock() * 1000)
     if made - latest > MAX_LATE_MS:
         return "too late for this close; waiting for the next one"
-    append(directory / "predictions.jsonl", predictions_for(rows, model.predict(rows), latest, model.month, made))
+    append(directory / "predictions.jsonl", predictions_for(rows, model.predict(rows), latest, model, made))
     return f"predicted {len(rows)} coins"
+
+
+def collect_symbols() -> list[str]:
+    """The original 10 coins plus the 50 from the v6 research, when that list has been chosen."""
+    try:
+        return SYMBOLS + json.loads(V6_SYMBOLS_FILE.read_text())["symbols"]
+    except (OSError, ValueError, KeyError):
+        return list(SYMBOLS)
 
 
 def main() -> int:
     from replay.market_data import _keyless_client
     DIR.mkdir(parents=True, exist_ok=True)
-    market, model = Market(DIR, _keyless_client()), Model()
+    client = _keyless_client()
+    symbols = collect_symbols()
+    market, model = Market(DIR, client, symbols), Model()
+    collector = Collector(DIR, client, symbols)
+    collector.start_liquidations()
     print("direction predictor started: no orders, public prices only", flush=True)
     while True:
         now = int(time.time() * 1000)
         try:
             message = cycle(market, model, DIR, now)
-            write_status(DIR, ok=True, message=message, model_month=model.month, train_rows=model.train_rows)
+            write_status(DIR, ok=True, message=message, model_month=model.month, train_rows=model.train_rows,
+                         collected=collector.counts)
         except Exception as e:     # network or exchange trouble: say so and try again shortly
             message = f"{type(e).__name__}: {str(e)[:200]}"
             write_status(DIR, ok=False, message=message, model_month=model.month)
@@ -200,6 +220,14 @@ def main() -> int:
             time.sleep(60)
             continue
         print(time.strftime("%F %T"), message, flush=True)
+        try:                        # after the time-critical prediction; a failure here only loses this round's extras
+            if message.startswith("predicted"):
+                collector.order_books(now // BAR_MS * BAR_MS)
+            collector.positioning(int(time.time() * 1000))
+        except Exception as e:
+            print(time.strftime("%F %T"), f"collector: {type(e).__name__}: {str(e)[:200]}", flush=True)
+        write_status(DIR, ok=True, message=message, model_month=model.month, train_rows=model.train_rows,
+                     collected=collector.counts)
         wake = (now // BAR_MS + 1) * BAR_MS + WAKE_AFTER_CLOSE_MS
         while time.time() * 1000 < wake:        # short sleeps follow the wall clock across laptop sleep
             time.sleep(30)
