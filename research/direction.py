@@ -1,5 +1,7 @@
 """Direction model for docs/research/direction_preregistration_v3.md (v4: fixed bet threshold, v5: order-flow and basis
-features). Parameters are fixed in those documents; do not tune."""
+features, v6: external features and transfer, v7: limit-order fills, positioning and market-relative features,
+v8: stricter fills and per-decision-time baskets).
+Parameters are fixed in those documents; do not tune."""
 
 from __future__ import annotations
 
@@ -21,6 +23,13 @@ FEATURES = ["r1", "r6", "r42", "r168", "vol", "vol_change", "btc_r1", "btc_r6", 
             "hour_sin", "hour_cos"]
 FLOW_FEATURES = ["taker_1", "taker_6", "btc_taker_1", "basis", "basis_change"]     # v5
 EXTERNAL_FEATURES = ["spx_r", "vix", "vix_change", "dxy_r", "dvol", "dvol_change"]  # v6
+POSITION_FEATURES = {"OI": ["oi_change_1", "oi_change_6", "oi_x_r1"],                # v7
+                     "LS": ["ls_accounts", "ls_accounts_change", "ls_top", "ls_top_change"]}
+MARKET_FEATURES = ["xs_r1", "xs_r6"]                                                # v7
+M5_MS = 300_000
+MAKER_COST = 0.0002         # v7: the exchange's base limit-order fee per side
+FILL_BARS = 6               # v7: a limit order waits 30 minutes
+BASKET_CAP = 10             # v8: a trade gets at most a tenth of the capital
 
 
 def _funding_sum(fts: np.ndarray, cum: np.ndarray, start: np.ndarray, end: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -96,6 +105,89 @@ def add_external(data: pd.DataFrame, external: dict[str, np.ndarray]) -> pd.Data
     return out
 
 
+def add_positioning(data: pd.DataFrame, metrics: dict[str, np.ndarray]) -> pd.DataFrame:
+    """Adds the v7 POSITION_FEATURES. metrics[symbol] rows are [time_ms, open_interest, accounts_long_short, top_positions_long_short].
+
+    A close at T uses the last row stamped T-15min .. T-5min, so nothing recorded at or after the close leaks in.
+    `data` holds each coin on a regular 4h grid (as `frame` returns it), so shifting by rows shifts by bars.
+    """
+    out = data.copy()
+    when = out["close_ms"].to_numpy()
+    values = np.full((len(out), 3), np.nan)
+    for symbol, idx in out.groupby("symbol").indices.items():
+        rows = metrics.get(symbol)
+        if rows is None or not len(rows):
+            continue
+        i = np.maximum(np.searchsorted(rows[:, 0], when[idx] - M5_MS, side="right") - 1, 0)
+        fresh = (rows[i, 0] <= when[idx] - M5_MS) & (rows[i, 0] >= when[idx] - 3 * M5_MS)
+        values[idx] = np.where(fresh[:, None], rows[i, 1:4], np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        oi, accounts, top = (pd.Series(np.log(values[:, k]), index=out.index) for k in range(3))
+    back = lambda s, bars: s.groupby(out["symbol"]).shift(bars)
+    out["oi_change_1"], out["oi_change_6"] = oi - back(oi, 1), oi - back(oi, 6)
+    out["oi_x_r1"] = out["oi_change_1"] * out["r1"] / out["sd42"]
+    out["ls_accounts"], out["ls_accounts_change"] = accounts, accounts - back(accounts, 6)
+    out["ls_top"], out["ls_top_change"] = top, top - back(top, 6)
+    features = sum(POSITION_FEATURES.values(), [])
+    out[features] = out[features].replace([np.inf, -np.inf], np.nan)
+    return out
+
+
+def add_market(data: pd.DataFrame) -> pd.DataFrame:
+    """Adds the v7 MARKET_FEATURES: each coin's return minus the median return of every coin at that close."""
+    out = data.copy()
+    for k in ("r1", "r6"):
+        out[f"xs_{k}"] = out[k] - out.groupby("close_ms")[k].transform("median")
+    return out
+
+
+def fill_windows(m5: np.ndarray) -> pd.DataFrame:
+    """Per 4h close T with all seven 5m bars present: `limit` is the first 5m close (the order price, placed at T+5min),
+    `low`/`high`/`last` are the lowest low, highest high and final close of the next FILL_BARS bars. m5 rows are
+    [open_ms, open, high, low, close], sorted by time."""
+    t = m5[:, 0].astype(np.int64)
+    df = pd.DataFrame({"T": t // BAR_MS * BAR_MS, "k": (t % BAR_MS) // M5_MS, "h": m5[:, 2], "l": m5[:, 3], "c": m5[:, 4]})
+    rest = df[(df["k"] >= 1) & (df["k"] <= FILL_BARS)].groupby("T").agg(low=("l", "min"), high=("h", "max"), last=("c", "last"), n=("c", "size"))
+    first = df[df["k"] == 0].set_index("T")["c"].rename("limit")
+    return rest[rest["n"] == FILL_BARS].join(first, how="inner")[["limit", "low", "high", "last"]]
+
+
+def maker_trades(selected: pd.DataFrame, windows: pd.DataFrame, horizon: int, maker_cost: float = MAKER_COST,
+                 taker_cost: float = SIDE_COST, gap: float = 0.0) -> pd.DataFrame:
+    """Each selected prediction as a limit-order trade (v7 M). `windows` is fill_windows per coin, indexed (symbol, T).
+
+    A limit order fills only when the price trades through it: a buy when the window's low is below the limit, a sell
+    when its high is above. An unfilled entry goes to market at the window's last close (drop those rows for "limit
+    only"); an unfilled exit always does. Trades without complete 5m bars at either end are left out.
+    `net_1x`/`net_2x` are after funding and both sides' costs; `gross_market` is first-5m-close to first-5m-close.
+    With `gap` the price must pass the order by that fraction before it counts as filled (v8: 0.05%).
+    """
+    t = selected.join(windows.add_prefix("e_"), on=["symbol", "close_ms"], how="inner")
+    t["exit_ms"] = t["close_ms"] + horizon * BAR_MS
+    t = t.join(windows.add_prefix("x_"), on=["symbol", "exit_ms"], how="inner")
+    long = (t["p"] > 0.5).to_numpy()
+    side = np.where(long, 1.0, -1.0)
+    below, above = 1 - gap, 1 + gap
+    t["entry_filled"] = np.where(long, t["e_low"] < t["e_limit"] * below, t["e_high"] > t["e_limit"] * above)
+    t["exit_filled"] = np.where(long, t["x_high"] > t["x_limit"] * above, t["x_low"] < t["x_limit"] * below)
+    entry = np.where(t["entry_filled"], t["e_limit"], t["e_last"])
+    exit_ = np.where(t["exit_filled"], t["x_limit"], t["x_last"])
+    funding = side * t["fund_hold"]
+    t["move"] = side * (exit_ / entry - 1)
+    t["gross_market"] = side * (t["x_limit"] / t["e_limit"] - 1) - funding
+    makers = t["entry_filled"].astype(int) + t["exit_filled"].astype(int)
+    cost = makers * maker_cost + (2 - makers) * taker_cost
+    t["net_1x"], t["net_2x"] = t["move"] - funding - cost, t["move"] - funding - 2 * cost
+    return t
+
+
+def basket_returns(trades: pd.DataFrame, column: str) -> pd.Series:
+    """v8: the return of each decision time's basket. Every trade gets min(1/BASKET_CAP, 1/n) of the capital, so a
+    time with 3 trades risks 30% and a time with 60 trades risks 100%, never more."""
+    by_time = trades.groupby("close_ms")[column]
+    return by_time.sum() * np.minimum(1 / BASKET_CAP, 1 / by_time.size())
+
+
 def fit(x: np.ndarray, y: np.ndarray, lam: float = LAMBDA) -> np.ndarray:
     """L2 logistic regression by Newton steps. w[0] is the unpenalized intercept."""
     a = np.hstack([np.ones((len(x), 1)), x])
@@ -130,7 +222,8 @@ def walk_forward(data: pd.DataFrame, horizon: int, train_start_ms: int, score_st
 
     Rows missing any of `require` are dropped too, so two feature sets can be compared on the same rows.
     With `train_symbols` only those coins are learned from; every coin is still predicted (v6 transfer test).
-    `thr` is the 90th percentile of |p - 0.5| on the training rows: the v6 "top 10% confidence" cutoff for that month.
+    `thr` is the 90th percentile of |p - 0.5| on the training rows: the v6 "top 10% confidence" cutoff for that month
+    (`thr95` and `thr98`: the v7 top 5% and top 2% cutoffs).
     """
     data = data.dropna(subset=list(features) + list(require) + ["fwd", "sd42"])
     data = data[(data["close_ms"] >= train_start_ms) & (data["close_ms"] + horizon * BAR_MS <= end_ms)]
@@ -155,7 +248,7 @@ def walk_forward(data: pd.DataFrame, horizon: int, train_start_ms: int, score_st
         part = data[test].copy()
         part["p"] = predict(w, scale(x_all[test]))
         part["base"] = y_all[train].mean()
-        part["thr"] = np.quantile(np.abs(predict(w, scale(x_all[train])) - 0.5), 0.9)
+        part["thr"], part["thr95"], part["thr98"] = np.quantile(np.abs(predict(w, scale(x_all[train])) - 0.5), [0.9, 0.95, 0.98])
         part["month"] = m
         parts.append(part)
     out = pd.concat(parts, ignore_index=True)

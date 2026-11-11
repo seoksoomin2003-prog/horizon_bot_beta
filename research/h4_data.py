@@ -218,3 +218,102 @@ def download_external(end_ms: int = VAL_END_MS) -> None:
 def load_external() -> dict[str, np.ndarray]:
     out = {name: np.load(EXTERNAL_DIR / f"{name}.npy") for name in ("spx", "vix", "dxy", "dvol")}
     return {name: rows[rows[:, 0] < VAL_END_MS] for name, rows in out.items()}
+
+
+# v7: the exchange's public archive (data.binance.vision). Files are parsed in memory; only the rows needed are kept.
+ARCHIVE = "https://data.binance.vision/data/futures/um"
+M5_DIR = DATA_DIR / "m5"              # [open_ms, open, high, low, close] of the 5m bars in the first 40 minutes after a 4h close
+METRICS_DIR = DATA_DIR / "metrics"    # [time_ms, open_interest, accounts_long_short, top_positions_long_short], last 15 minutes before a 4h close
+M5_MS = 300_000
+V7_START_MS = utc_ms("2021-12-01")
+
+
+def _days(start_ms: int, end_ms: int) -> list[str]:
+    return [time.strftime("%Y-%m-%d", time.gmtime(t / 1000)) for t in range(start_ms, end_ms, 86_400_000)]
+
+
+def archive_files(symbol: str, start_ms: int = V7_START_MS, end_ms: int = VAL_END_MS) -> dict[str, list[str]]:
+    """Archive paths wholly before end_ms: monthly 5m klines, daily ones for the last partial month, daily metrics."""
+    _flow_guard(end_ms)
+    days = _days(start_ms, end_ms)
+    last_month = days[-1][:7]
+    months = sorted({d[:7] for d in days} - {last_month})
+    kline = lambda period, stamp: f"{ARCHIVE}/{period}/klines/{symbol}/5m/{symbol}-5m-{stamp}.zip"
+    return {"m5": [kline("monthly", m) for m in months] + [kline("daily", d) for d in days if d[:7] == last_month],
+            "metrics": [f"{ARCHIVE}/daily/metrics/{symbol}/{symbol}-metrics-{d}.zip" for d in _days(utc_ms("2021-01-01") - 86_400_000, end_ms)]}
+
+
+def parse_m5(text: str) -> list[list[float]]:
+    rows = []
+    for line in text.splitlines():
+        f = line.split(",")
+        if f[0].isdigit() and int(f[0]) % BAR_MS < 8 * M5_MS:
+            rows.append([int(f[0])] + [float(v) for v in f[1:5]])
+    return rows
+
+
+def parse_metrics(text: str) -> list[list[float]]:
+    rows = []
+    for line in text.splitlines():
+        f = line.replace('"', "").split(",")
+        if len(f) < 7 or not f[0][:1].isdigit():
+            continue
+        t = calendar.timegm(time.strptime(f[0], "%Y-%m-%d %H:%M:%S")) * 1000
+        if t % BAR_MS >= BAR_MS - 3 * M5_MS:
+            number = lambda v: float(v) if v else np.nan
+            rows.append([t, number(f[2]), number(f[6]), number(f[5])])
+    return rows
+
+
+def download_archive(symbols: list[str], kinds: tuple[str, ...] = ("m5", "metrics"), end_ms: int = VAL_END_MS, parallel: int = 24) -> None:
+    """Fetches the archive files of each coin and saves the kept rows. A missing file (coin not listed yet) is skipped."""
+    import asyncio
+    import io
+    import zipfile
+
+    import aiohttp
+    _flow_guard(end_ms)
+    parsers, folders = {"m5": parse_m5, "metrics": parse_metrics}, {"m5": M5_DIR, "metrics": METRICS_DIR}
+
+    async def fetch(session, gate, url: str, parse) -> list:
+        async with gate:
+            for attempt in range(4):
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as r:
+                        if r.status == 404:
+                            return []
+                        r.raise_for_status()
+                        with zipfile.ZipFile(io.BytesIO(await r.read())) as z:
+                            return parse(z.read(z.namelist()[0]).decode())
+                except (aiohttp.ClientError, asyncio.TimeoutError, zipfile.BadZipFile):
+                    await asyncio.sleep(2 * (attempt + 1))
+            raise RuntimeError(f"could not fetch {url}")
+
+    async def run() -> None:
+        gate = asyncio.Semaphore(parallel)
+        async with aiohttp.ClientSession() as session:
+            for symbol in symbols:
+                files = archive_files(symbol, end_ms=end_ms)
+                for kind in kinds:
+                    path = folders[kind] / f"{symbol}.npy"
+                    if path.exists():
+                        continue
+                    pages = await asyncio.gather(*(fetch(session, gate, u, parsers[kind]) for u in files[kind]))
+                    rows = np.array([r for page in pages for r in page], dtype=float).reshape(-1, 5 if kind == "m5" else 4)
+                    rows = rows[np.unique(rows[:, 0], return_index=True)[1]]
+                    np.save(path, rows[rows[:, 0] < end_ms])
+                    print(f"{symbol} {kind}: {len(rows)} rows from {sum(bool(p) for p in pages)} of {len(pages)} files", flush=True)
+
+    for folder in folders.values():
+        folder.mkdir(parents=True, exist_ok=True)
+    asyncio.run(run())
+
+
+def load_m5(symbol: str) -> np.ndarray:
+    rows = np.load(M5_DIR / f"{symbol}.npy")
+    return rows[rows[:, 0] < VAL_END_MS]
+
+
+def load_metrics(symbol: str) -> np.ndarray:
+    rows = np.load(METRICS_DIR / f"{symbol}.npy")
+    return rows[rows[:, 0] < VAL_END_MS]
