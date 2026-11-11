@@ -2,13 +2,14 @@
 
 It also collects data the exchange does not keep (predictor/collect.py) for later research.
 
-Every 4-hour bar close it records, for each coin, the v3 model's probability that the next 4 hours close higher (the
-D4 candidate), and marks the "confident" ones: the top 10% by the model's own training-time measure, which hit about
-55% on coins the model never saw (docs/research/direction_result_v6.md). One bar later it records what happened. The dashboard
-reads both files and keeps score. A prediction is only recorded within MAX_LATE_MS of the close, so a laptop that slept
-through a close skips it instead of predicting after the fact.
+Every 4-hour bar close it records, for each coin, the model's probability that the price is higher 4 hours later and
+8 hours later (one model per horizon), and marks the "confident" ones: the top 10% and top 5% by the model's own
+training-time measure. On coins the model never saw, the top 10% hit about 56% at 4 hours and 57% at 8 hours
+(docs/research/direction_result_v7.md). When the horizon ends it records what happened. The dashboard reads both files
+and keeps score. A prediction is only recorded within MAX_LATE_MS of the close, so a laptop that slept through a close
+skips it instead of predicting after the fact.
 
-The model refits on the first of every month on rows whose answer was known by then, exactly as in the research.
+Each model refits on the first of every month on rows whose answer was known by then, exactly as in the research.
 
   .venv/bin/python -m predictor.live         (normally through ./run_predictor.sh)
 """
@@ -34,6 +35,7 @@ from predictor.collect import Collector  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 DIR = ROOT / "runtime" / "predictor"
 SIGNAL_GAIN = 0.005             # v4's fixed bet threshold: expected gain above 0.5%
+HORIZONS = (1, 2)              # bars ahead: 4 hours and 8 hours
 MAX_LATE_MS = 15 * 60_000
 WAKE_AFTER_CLOSE_MS = 60_000
 
@@ -102,33 +104,35 @@ class Market:
                                              lambda r: r[0] + BAR_MS <= now_ms)       # completed bars only
             self.funding[symbol] = self._top_up(f"{symbol}.funding.npy", self.funding[symbol], rates, now_ms, lambda r: True)
 
-    def frames(self) -> pd.DataFrame:
-        btc = frame("BTCUSDT", self.bars["BTCUSDT"], self.funding["BTCUSDT"], None, 1).set_index("close_ms")[["r1", "r6"]]
-        return pd.concat([frame(s, self.bars[s], self.funding[s], None if s == "BTCUSDT" else btc, 1) for s in self.symbols],
-                         ignore_index=True)
+    def frames(self, horizon: int = 1) -> pd.DataFrame:
+        btc = frame("BTCUSDT", self.bars["BTCUSDT"], self.funding["BTCUSDT"], None, horizon).set_index("close_ms")[["r1", "r6"]]
+        return pd.concat([frame(s, self.bars[s], self.funding[s], None if s == "BTCUSDT" else btc, horizon)
+                          for s in self.symbols], ignore_index=True)
 
 
 class Model:
     """The research model refit monthly: standardize on the training rows, clip, L2 logistic regression.
 
-    It learns from the original 10 coins only, also when it predicts more (v6: learning from 60 did not help), and
-    keeps `thr`, the 90th percentile of |p - 0.5| on its training rows: predictions at or above it are "confident".
+    It learns from every coin it predicts (v7 H2: learning from more coins predicted unseen coins better) and keeps
+    `thr` and `thr95`, the 90th and 95th percentiles of |p - 0.5| on its training rows: the "confident" cutoffs.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, horizon: int = 1) -> None:
+        self.horizon = horizon
         self.month: int | None = None
+        self.train_rows = 0
 
     def refit_if_needed(self, data: pd.DataFrame, now_ms: int) -> None:
         month = int(pd.Timestamp(now_ms, unit="ms").to_period("M").start_time.value // 1_000_000)
         if month == self.month:
             return
-        rows = data[data["symbol"].isin(SYMBOLS)].dropna(subset=FEATURES + ["fwd", "sd42"])
-        rows = rows[(rows["close_ms"] >= DEV_START_MS) & (rows["close_ms"] + BAR_MS <= month)]
+        rows = data.dropna(subset=FEATURES + ["fwd", "sd42"])
+        rows = rows[(rows["close_ms"] >= DEV_START_MS) & (rows["close_ms"] + self.horizon * BAR_MS <= month)]
         x = rows[FEATURES].to_numpy(float)
         self.mean, self.std = x.mean(axis=0), x.std(axis=0)
         self.std[self.std == 0] = 1.0
         self.w = fit(self._scale(x), (rows["fwd"] > 0).to_numpy(float))
-        self.thr = float(np.quantile(np.abs(predict(self.w, self._scale(x)) - 0.5), 0.9))
+        self.thr, self.thr95 = (float(v) for v in np.quantile(np.abs(predict(self.w, self._scale(x)) - 0.5), [0.9, 0.95]))
         self.month, self.train_rows = month, len(rows)
 
     def _scale(self, x: np.ndarray) -> np.ndarray:
@@ -141,23 +145,26 @@ class Model:
 def predictions_for(rows: pd.DataFrame, p: np.ndarray, close_ms: int, model: Model, made_ms: int) -> list[dict]:
     out = []
     for (_, r), prob in zip(rows.iterrows(), p):
-        gain = abs(2 * prob - 1) * r["sd42"] * ABS_MOVE
-        out.append({"close_ms": close_ms, "symbol": r["symbol"], "price": float(math.exp(r["logc"])), "p_up": float(prob),
-                    "expected_gain": float(gain), "signal": bool(gain > SIGNAL_GAIN),
-                    "confident": bool(abs(prob - 0.5) >= model.thr), "model_month": model.month, "made_ms": made_ms})
+        gain = abs(2 * prob - 1) * r["sd42"] * math.sqrt(model.horizon) * ABS_MOVE
+        out.append({"close_ms": close_ms, "horizon": model.horizon, "symbol": r["symbol"], "price": float(math.exp(r["logc"])),
+                    "p_up": float(prob), "expected_gain": float(gain), "signal": bool(gain > SIGNAL_GAIN),
+                    "confident": bool(abs(prob - 0.5) >= model.thr), "top5": bool(abs(prob - 0.5) >= model.thr95),
+                    "model_month": model.month, "made_ms": made_ms})
     return out
 
 
 def outcomes_for(predicted: list[dict], scored: set, data: pd.DataFrame) -> list[dict]:
-    """The next bar's close for every prediction not yet scored whose next bar has closed."""
+    """The close at the end of the horizon for every prediction not yet scored whose horizon has ended.
+    Rows written before 8-hour predictions existed have no `horizon`: they are 4-hour ones."""
     close = data.set_index(["symbol", "close_ms"])["logc"]
     out = []
     for p in predicted:
-        key = (p["symbol"], p["close_ms"])
-        nxt = (p["symbol"], p["close_ms"] + BAR_MS)
+        horizon = p.get("horizon", 1)
+        key = (p["symbol"], p["close_ms"], horizon)
+        nxt = (p["symbol"], p["close_ms"] + horizon * BAR_MS)
         if key in scored or nxt not in close.index or not np.isfinite(close[nxt]):
             continue
-        out.append({"close_ms": p["close_ms"], "symbol": p["symbol"], "next_price": float(math.exp(close[nxt])),
+        out.append({"close_ms": p["close_ms"], "horizon": horizon, "symbol": p["symbol"], "next_price": float(math.exp(close[nxt])),
                     "log_return": float(close[nxt] - math.log(p["price"]))})
     return out
 
@@ -168,26 +175,29 @@ def with_closes(data: pd.DataFrame, bars: dict[str, np.ndarray]) -> pd.DataFrame
     return data.merge(closes, on=["symbol", "close_ms"], how="left")
 
 
-def cycle(market: Market, model: Model, directory: Path, now_ms: int, clock=time.time) -> str:
+def cycle(market: Market, models: list[Model], directory: Path, now_ms: int, clock=time.time) -> str:
     market.update(now_ms)
-    data = with_closes(market.frames(), market.bars)
-    model.refit_if_needed(data, now_ms)
-
     predicted = read_jsonl(directory / "predictions.jsonl")
-    scored = {(o["symbol"], o["close_ms"]) for o in read_jsonl(directory / "outcomes.jsonl")}
-    append(directory / "outcomes.jsonl", outcomes_for(predicted, scored, data))
-
+    scored = {(o["symbol"], o["close_ms"], o.get("horizon", 1)) for o in read_jsonl(directory / "outcomes.jsonl")}
     latest = now_ms // BAR_MS * BAR_MS
-    if latest in {p["close_ms"] for p in predicted}:
-        return "already predicted"
-    rows = data[data["close_ms"] == latest].dropna(subset=FEATURES + ["sd42", "logc"])
-    if rows.empty:
-        return "no completed bar for this close yet"
-    made = int(clock() * 1000)
-    if made - latest > MAX_LATE_MS:
-        return "too late for this close; waiting for the next one"
-    append(directory / "predictions.jsonl", predictions_for(rows, model.predict(rows), latest, model, made))
-    return f"predicted {len(rows)} coins"
+    messages = []
+    for model in models:
+        data = with_closes(market.frames(model.horizon), market.bars)
+        model.refit_if_needed(data, now_ms)
+        mine = [p for p in predicted if p.get("horizon", 1) == model.horizon]
+        append(directory / "outcomes.jsonl", outcomes_for(mine, scored, data))
+        rows = data[data["close_ms"] == latest].dropna(subset=FEATURES + ["sd42", "logc"])
+        made = int(clock() * 1000)
+        if latest in {p["close_ms"] for p in mine}:
+            messages.append("already predicted")
+        elif rows.empty:
+            messages.append("no completed bar for this close yet")
+        elif made - latest > MAX_LATE_MS:
+            messages.append("too late for this close; waiting for the next one")
+        else:
+            append(directory / "predictions.jsonl", predictions_for(rows, model.predict(rows), latest, model, made))
+            messages.append(f"predicted {len(rows)} coins")
+    return next((m for m in messages if m.startswith("predicted")), messages[0])
 
 
 def collect_symbols() -> list[str]:
@@ -203,19 +213,19 @@ def main() -> int:
     DIR.mkdir(parents=True, exist_ok=True)
     client = _keyless_client()
     symbols = collect_symbols()
-    market, model = Market(DIR, client, symbols), Model()
+    market, models = Market(DIR, client, symbols), [Model(h) for h in HORIZONS]
     collector = Collector(DIR, client, symbols)
     collector.start_liquidations()
     print("direction predictor started: no orders, public prices only", flush=True)
     while True:
         now = int(time.time() * 1000)
         try:
-            message = cycle(market, model, DIR, now)
-            write_status(DIR, ok=True, message=message, model_month=model.month, train_rows=model.train_rows,
+            message = cycle(market, models, DIR, now)
+            write_status(DIR, ok=True, message=message, model_month=models[0].month, train_rows=models[0].train_rows,
                          collected=collector.counts)
         except Exception as e:     # network or exchange trouble: say so and try again shortly
             message = f"{type(e).__name__}: {str(e)[:200]}"
-            write_status(DIR, ok=False, message=message, model_month=model.month)
+            write_status(DIR, ok=False, message=message, model_month=models[0].month)
             print(time.strftime("%F %T"), message, flush=True)
             time.sleep(60)
             continue
@@ -226,7 +236,7 @@ def main() -> int:
             collector.positioning(int(time.time() * 1000))
         except Exception as e:
             print(time.strftime("%F %T"), f"collector: {type(e).__name__}: {str(e)[:200]}", flush=True)
-        write_status(DIR, ok=True, message=message, model_month=model.month, train_rows=model.train_rows,
+        write_status(DIR, ok=True, message=message, model_month=models[0].month, train_rows=models[0].train_rows,
                      collected=collector.counts)
         wake = (now // BAR_MS + 1) * BAR_MS + WAKE_AFTER_CLOSE_MS
         while time.time() * 1000 < wake:        # short sleeps follow the wall clock across laptop sleep

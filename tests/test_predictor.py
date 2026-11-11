@@ -1,4 +1,4 @@
-"""The live direction predictor: on-time predictions only, scored one bar later, and no orders anywhere."""
+"""The live direction predictor: on-time predictions only, scored when the horizon ends, and no orders anywhere."""
 import json
 import math
 
@@ -32,7 +32,7 @@ class FakeMarket:
 
 
 def run_cycle(tmp_path, market, now_ms, made_ms):
-    return live.cycle(market, live.Model(), tmp_path, now_ms, clock=lambda: made_ms / 1000)
+    return live.cycle(market, [live.Model(h) for h in live.HORIZONS], tmp_path, now_ms, clock=lambda: made_ms / 1000)
 
 
 def test_predicts_every_coin_once_on_time(tmp_path, monkeypatch):
@@ -41,10 +41,15 @@ def test_predicts_every_coin_once_on_time(tmp_path, monkeypatch):
     market = FakeMarket(close)
     assert run_cycle(tmp_path, market, close + 60_000, close + 90_000) == f"predicted {len(SYMBOLS)} coins"
     rows = live.read_jsonl(tmp_path / "predictions.jsonl")
-    assert {r["symbol"] for r in rows} == set(SYMBOLS) and {r["close_ms"] for r in rows} == {close}
+    assert sorted((r["symbol"], r["horizon"]) for r in rows) == sorted((s, h) for s in SYMBOLS for h in (1, 2))
+    assert {r["close_ms"] for r in rows} == {close}
     assert all(0 < r["p_up"] < 1 and r["signal"] == (r["expected_gain"] > 0.005) for r in rows)
-    assert all(isinstance(r["confident"], bool) for r in rows)
+    assert all(isinstance(r["confident"], bool) and (r["confident"] or not r["top5"]) for r in rows)   # top 5% is inside top 10%
     btc = next(r for r in rows if r["symbol"] == "BTCUSDT")
+    old = [{k: v for k, v in r.items() if k != "horizon"} for r in rows if r["horizon"] == 1]      # a file from before 8h predictions
+    (tmp_path / "predictions.jsonl").write_text("".join(json.dumps(r) + "\n" for r in old))
+    assert run_cycle(tmp_path, market, close + 100_000, close + 110_000) == f"predicted {len(SYMBOLS)} coins"
+    assert sum(r.get("horizon") == 2 for r in live.read_jsonl(tmp_path / "predictions.jsonl")) == len(SYMBOLS)
     assert math.isclose(btc["price"], market.bars["BTCUSDT"][-1, 4])
     assert run_cycle(tmp_path, market, close + 120_000, close + 130_000) == "already predicted"
 
@@ -56,21 +61,30 @@ def test_a_late_close_is_skipped_not_predicted_after_the_fact(tmp_path, monkeypa
     assert out.startswith("too late") and not (tmp_path / "predictions.jsonl").exists()
 
 
-def test_outcome_is_the_next_bar_close(tmp_path, monkeypatch):
+def test_outcome_is_the_close_at_the_end_of_the_horizon(tmp_path, monkeypatch):
     monkeypatch.setattr(live, "DEV_START_MS", 0)
     close = T0 + 400 * BAR_MS
     later = FakeMarket(close)
     run_cycle(tmp_path, later, close + 60_000, close + 60_000)
-    for s in SYMBOLS:                                # one more bar closes, 2% above the last
-        last = later.bars[s][-1].copy()
-        last[0] += BAR_MS
-        last[1:5] *= 1.02
-        later.bars[s] = np.vstack([later.bars[s], last])
+    def one_more_bar():                              # closes 2% above the last
+        for s in SYMBOLS:
+            last = later.bars[s][-1].copy()
+            last[0] += BAR_MS
+            last[1:5] *= 1.02
+            later.bars[s] = np.vstack([later.bars[s], last])
+
+    one_more_bar()
     run_cycle(tmp_path, later, close + BAR_MS + 60_000, close + BAR_MS + 60_000)
-    outcomes = {o["symbol"]: o for o in live.read_jsonl(tmp_path / "outcomes.jsonl")}
-    assert set(outcomes) == set(SYMBOLS) and all(o["close_ms"] == close for o in outcomes.values())
+    first = [o for o in live.read_jsonl(tmp_path / "outcomes.jsonl") if o["close_ms"] == close]
+    assert {(o["symbol"], o["horizon"]) for o in first} == {(s, 1) for s in SYMBOLS}       # the 8h answer is not known yet
     b = later.bars["ETHUSDT"]
-    assert math.isclose(outcomes["ETHUSDT"]["log_return"], math.log(b[-1, 4] / b[-2, 4]))
+    eth = next(o for o in first if o["symbol"] == "ETHUSDT")
+    assert math.isclose(eth["log_return"], math.log(b[-1, 4] / b[-2, 4]))
+    one_more_bar()
+    run_cycle(tmp_path, later, close + 2 * BAR_MS + 60_000, close + 2 * BAR_MS + 60_000)
+    eth8 = next(o for o in live.read_jsonl(tmp_path / "outcomes.jsonl")
+                if o["symbol"] == "ETHUSDT" and o["close_ms"] == close and o["horizon"] == 2)
+    assert math.isclose(eth8["log_return"], 2 * math.log(1.02))
 
 
 def test_model_trains_only_on_answers_known_before_the_month(monkeypatch):
@@ -83,10 +97,16 @@ def test_model_trains_only_on_answers_known_before_the_month(monkeypatch):
     model.refit_if_needed(data, now)
     usable = data.dropna(subset=live.FEATURES + ["fwd", "sd42"])
     assert model.month == month and model.train_rows == int((usable["close_ms"] + BAR_MS <= month).sum())
-    extra = data[data["symbol"] == "BTCUSDT"].assign(symbol="NEWCOIN")      # a coin outside the original 10 is not learned from
+    assert 0 < model.thr <= model.thr95 < 0.5
+    eight = live.Model(2)                            # an 8h answer is known one bar later, so one bar fewer per coin is usable
+    data8 = live.with_closes(market.frames(2), market.bars)
+    eight.refit_if_needed(data8, now)
+    usable8 = data8.dropna(subset=live.FEATURES + ["fwd", "sd42"])
+    assert eight.train_rows == int((usable8["close_ms"] + 2 * BAR_MS <= month).sum()) == model.train_rows - len(SYMBOLS)
+    extra = data[data["symbol"] == "BTCUSDT"].assign(symbol="NEWCOIN")      # every coin it predicts is learned from (v7 H2)
     wider = live.Model()
     wider.refit_if_needed(pd.concat([data, extra], ignore_index=True), now)
-    assert wider.train_rows == model.train_rows and 0 < wider.thr < 0.5
+    assert wider.train_rows == model.train_rows + int((extra.dropna(subset=live.FEATURES + ["fwd", "sd42"])["close_ms"] + BAR_MS <= month).sum())
 
 
 def write(path, rows):
@@ -99,15 +119,22 @@ def test_dashboard_scores_predictions(tmp_path):
     write(folder / "predictions.jsonl", [
         {"close_ms": 0, "symbol": "BTCUSDT", "price": 100.0, "p_up": 0.6, "expected_gain": 0.006, "signal": True, "confident": True},
         {"close_ms": 0, "symbol": "ETHUSDT", "price": 10.0, "p_up": 0.45, "expected_gain": 0.001, "signal": False},
-        {"close_ms": BAR_MS, "symbol": "BTCUSDT", "price": 101.0, "p_up": 0.55, "expected_gain": 0.002, "signal": False}])
+        {"close_ms": BAR_MS, "symbol": "BTCUSDT", "price": 101.0, "p_up": 0.55, "expected_gain": 0.002, "signal": False},
+        {"close_ms": 0, "horizon": 2, "symbol": "BTCUSDT", "price": 100.0, "p_up": 0.3, "confident": True, "top5": True},
+        {"close_ms": 0, "horizon": 2, "symbol": "ETHUSDT", "price": 10.0, "p_up": 0.6, "confident": True, "top5": False},
+        {"close_ms": BAR_MS, "horizon": 2, "symbol": "BTCUSDT", "price": 101.0, "p_up": 0.7, "confident": True, "top5": True}])
     write(folder / "outcomes.jsonl", [
         {"close_ms": 0, "symbol": "BTCUSDT", "next_price": 101.0, "log_return": math.log(1.01)},
-        {"close_ms": 0, "symbol": "ETHUSDT", "next_price": 10.5, "log_return": math.log(1.05)}])
+        {"close_ms": 0, "symbol": "ETHUSDT", "next_price": 10.5, "log_return": math.log(1.05)},
+        {"close_ms": 0, "horizon": 2, "symbol": "BTCUSDT", "next_price": 99.0, "log_return": math.log(0.99)},
+        {"close_ms": 0, "horizon": 2, "symbol": "ETHUSDT", "next_price": 9.0, "log_return": math.log(0.9)}])
     q = prediction_summary(tmp_path, now_ms=BAR_MS)
     assert (q["scored"], q["hits"], q["ups"], q["signals"], q["signal_hits"]) == (2, 1, 2, 1, 1)
     assert math.isclose(q["signal_net"], 0.01 - 0.002)
     assert (q["confident"], q["confident_hits"]) == (1, 1) and math.isclose(q["confident_net"], 0.01 - 0.002)
     assert [r["symbol"] for r in q["latest"]] == ["BTCUSDT"] and q["latest"][0]["hit"] is None
+    assert q["latest"][0]["p_up_8h"] == 0.7              # 8h rows are scored apart and never mixed into the 4h numbers
+    assert q["eight"] == {"scored": 2, "hits": 1, "confident": 2, "confident_hits": 1, "top5": 1, "top5_hits": 1}
     assert not q["running"]
 
 

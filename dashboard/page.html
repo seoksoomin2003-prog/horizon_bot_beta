@@ -86,7 +86,7 @@ button:disabled { opacity: .5; cursor: default; }
   <div id="alert" class="notice alert" hidden></div>
 
   <section class="card" aria-label="방향 예측 기록">
-    <h2>방향 예측 기록 <span class="label">주문 없음 · 4시간봉 마감마다 다음 4시간 방향을 기록하고 4시간 뒤 채점</span></h2>
+    <h2>방향 예측 기록 <span class="label">주문 없음 · 4시간봉 마감마다 4시간 뒤와 8시간 뒤 방향을 기록하고 그때 채점</span></h2>
     <p class="current" id="predstatus">불러오는 중</p>
     <div class="buttons">
       <button id="predstart" type="button">예측 기록 켜기</button>
@@ -100,10 +100,16 @@ button:disabled { opacity: .5; cursor: default; }
       <div><dt>확신 상위 10% 적중률</dt><dd id="predsig">-</dd></div>
       <div><dt>확신 상위 10% 건당 손익 (비용 0.2% 차감)</dt><dd id="predsignet">-</dd></div>
     </dl>
+    <dl class="kpis spaced">
+      <div><dt>8시간 예측 채점</dt><dd id="pred8scored">-</dd></div>
+      <div><dt>8시간 적중률</dt><dd id="pred8hit">-</dd></div>
+      <div><dt>8시간 확신 상위 10% 적중률</dt><dd id="pred8conf">-</dd></div>
+      <div><dt>8시간 확신 상위 5% 적중률</dt><dd id="pred8top5">-</dd></div>
+    </dl>
     <p class="label" id="prednote"></p>
     <h2 class="spaced">최근 예측 <span class="label" id="predlatest"></span></h2>
     <div class="scroll"><table>
-      <thead><tr><th>코인</th><th class="num">가격</th><th class="num">상승 확률</th><th>예측</th><th class="num">예상 이익</th><th>확신 상위 10%</th></tr></thead>
+      <thead><tr><th>코인</th><th class="num">가격</th><th class="num">상승 확률</th><th>예측</th><th class="num">예상 이익</th><th>확신 상위 10%</th><th class="num">8시간 상승 확률</th></tr></thead>
       <tbody id="predrows"></tbody>
     </table></div>
     <h2 class="spaced">채점 기록 <span class="label">최근 60건</span></h2>
@@ -296,13 +302,18 @@ function renderPredictions(q) {
   $("predup").textContent = ratio(q.ups, q.scored);
   $("predsig").textContent = ratio(q.confident_hits, q.confident);
   $("predsignet").textContent = q.confident_net == null ? "없음" : (q.confident_net > 0 ? "+" : "") + pct(q.confident_net);
+  const e = q.eight || {};
+  $("pred8scored").textContent = `${e.scored || 0}건`;
+  $("pred8hit").textContent = ratio(e.hits, e.scored);
+  $("pred8conf").textContent = ratio(e.confident_hits, e.confident);
+  $("pred8top5").textContent = ratio(e.top5_hits, e.top5);
   const margin = q.scored ? 1.96 * Math.sqrt(0.25 / q.scored) : null;
   $("prednote").textContent = (margin == null ? "아직 채점된 예측이 없습니다. " : `지금 표본으로는 적중률이 우연만으로도 약 ±${(margin * 100).toFixed(1)}%p 흔들립니다. `)
-    + "연구에서 이 모델은 처음 보는 코인 50개에서 적중률 52.0%, 확신 상위 10%에서 54.7%였습니다. 다만 비용을 빼면 수익이 확인되지 않았습니다."
+    + "연구(v7)에서 처음 보는 코인의 확신 상위 10% 적중률은 4시간 55.9%, 8시간 57.5%, 8시간 상위 5%는 58.7%였습니다. 다만 최근 9개월은 그보다 낮았고, 실제로 수익이 나는지는 확인되지 않았습니다."
     + (q.collected ? ` 이번 실행에서 수집한 연구용 데이터: 미결제약정·롱숏 비율 ${q.collected.positioning}행, 호가 ${q.collected.orderbook}행, 강제청산 ${q.collected.liquidations}건.` : "");
   $("predlatest").textContent = q.latest.length ? `${when(q.latest[0].close_ms)} 마감 기준 · 코인 ${q.latest_count}개 중 확신이 큰 ${q.latest.length}개` : "";
   fillRows("predrows", q.latest.map((r) => row([[sym(r.symbol)], [price(r.price), 1], [pct(r.p_up, 1), 1], [dirText(r.p_up)],
-    [pct(r.expected_gain), 1], [r.confident ? "예" : ""]])), "아직 예측이 없습니다. 켜면 다음 4시간봉 마감(한국 시각 1·5·9·13·17·21시) 때 나옵니다.", 6);
+    [pct(r.expected_gain), 1], [r.confident ? "예" : ""], [r.p_up_8h == null ? "-" : pct(r.p_up_8h, 1), 1]])), "아직 예측이 없습니다. 켜면 다음 4시간봉 마감(한국 시각 1·5·9·13·17·21시) 때 나옵니다.", 7);
   fillRows("predscoredrows", q.recent.map((r) => row([[when(r.close_ms)], [sym(r.symbol)], [pct(r.p_up, 1), 1], [dirText(r.p_up)],
     [r.up ? "오름" : "내림"], [price(r.next_price), 1], [r.hit ? "맞음" : "틀림"]])), "아직 채점된 예측이 없습니다.", 7);
 }
