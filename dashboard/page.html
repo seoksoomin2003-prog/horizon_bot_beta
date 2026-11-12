@@ -158,6 +158,7 @@ button:disabled { opacity: .5; cursor: default; }
       <div><dt>승률 (부분 포함)</dt><dd id="winrate">-</dd></div>
       <div><dt>최대 낙폭</dt><dd id="drawdown">-</dd></div>
     </dl>
+    <p class="label" id="funding"></p>
   </section>
   <div id="sample" class="notice" hidden></div>
 
@@ -356,6 +357,12 @@ const TAGS = [
     (m) => `최소 주문으로 올림: ${m[1]} ${m[3]}개 (${m[4]} USDT, 손절까지 위험 자금의 ${m[5]})`],
   [/^\[SKIPPED: PAPER_RULES\] (\S+) (LONG|SHORT): spot has no short selling$/, (m) => `건너뜀: ${m[1]} 숏 (현물은 숏 불가)`],
   [/^\[SKIPPED: PAPER_RULES\] (\S+) (LONG|SHORT): (.*)$/, (m) => `건너뜀: ${m[1]} ${m[2] === "LONG" ? "롱" : "숏"} (${m[3]})`],
+  [/^\[REJECTED: SLIPPAGE\] (\S+) (LONG|SHORT): ([\d.]+%) expected, limit ([\d.]+%), no order sent$/,
+    (m) => `진입 취소: ${m[1]} ${m[2] === "LONG" ? "롱" : "숏"} (호가 기준 예상 슬리피지 ${m[3]}, 한도 ${m[4]})`],
+  [/^\[REJECTED: SLIPPAGE\] (\S+) (LONG|SHORT): order book missing.*$/,
+    (m) => `진입 취소: ${m[1]} ${m[2] === "LONG" ? "롱" : "숏"} (호가를 읽지 못했거나 주문 수량을 받을 호가가 부족)`],
+  [/^\[SLIPPAGE\] (\S+) (LONG|SHORT): filled ([+-][\d.]+%) from the decision price \(book estimate ([\d.]+%)\)$/,
+    (m) => `체결 슬리피지: ${m[1]} ${m[2] === "LONG" ? "롱" : "숏"} ${m[3]} (호가 기준 예상 ${m[4]})`],
   [/^\[STARTUP\] (.*)$/, (m) => `시작 점검: ${m[1]}`],
   [/^\[TIMEOUT\] (.*)$/, (m) => `응답 지연: ${m[1]}`],
   [/COOLDOWN ACTIVATED/, () => "손실 3연속으로 1시간 진입 중지"],
@@ -486,6 +493,10 @@ function render(d) {
   $("cash").textContent = money(d.cash);
   $("return").textContent = `시작 자금 ${money(d.initial)} USDT 대비 ${d.return > 0 ? "+" : ""}${pct(d.return)}`;
   $("equity").textContent = money(d.equity);
+  const f = d.funding;
+  if (f) $("funding").textContent = `빗썸 ↔ 바이낸스 입출금 왕복 비용 ${money(f.total)} USDT (빗썸 매수 ${money(f.buy_fee)} · 바이낸스로 전송 ${money(f.to_binance)} · 빗썸으로 전송 ${money(f.to_bithumb)} · 빗썸 매도 ${money(f.sell_fee)}). `
+    + `이 비용까지 빼면 손익 ${signed(f.net)} USDT. 평가 자산이 ${money(f.break_even)} USDT(시작 자금 대비 +${pct(f.break_even_return)})를 넘어야 본전입니다. `
+    + `테더(USDT)·트론 전송, 빗썸 수수료 ${pct(f.bithumb_fee)} 기준 (${f.checked} 확인). 두 거래소의 가격 차이는 뺐습니다.`;
   $("realized").textContent = signed(d.realized);
   $("fees").textContent = money(d.fees);
   $("closes").textContent = `${d.closes}건`;

@@ -279,3 +279,21 @@ def test_past_runs_list_archived_records(root):
     archive_records(root, now=0)
     runs = build_summary(root)["past_runs"]
     assert len(runs) == 1 and runs[0]["initial"] == 1000.0 and runs[0]["closes"] == 1 and runs[0]["open_positions"] == 1
+
+
+def test_funding_round_trip_adds_every_fee_on_the_way_in_and_out():
+    from paper import funding
+    r = funding.round_trip(50.0, 60.0, fee=0.0025)
+    assert r["buy_fee"] == pytest.approx(0.125) and r["to_binance"] == funding.TO_BINANCE_USDT
+    assert r["to_bithumb"] == funding.TO_BITHUMB_USDT and r["sell_fee"] == pytest.approx((60.0 - funding.TO_BITHUMB_USDT) * 0.0025)
+    assert r["total"] == pytest.approx(r["buy_fee"] + r["to_binance"] + r["to_bithumb"] + r["sell_fee"])
+    assert r["net"] == pytest.approx(60.0 - 50.0 - r["total"])                     # trading profit minus the trip's costs
+    even = funding.round_trip(50.0, r["break_even"], fee=0.0025)
+    assert even["net"] == pytest.approx(0.0, abs=1e-9) and r["break_even"] > 50.0 + funding.TO_BITHUMB_USDT
+    assert funding.round_trip(50.0, 1.0)["back"] == 0.0                              # less than the transfer fee: nothing arrives
+
+
+def test_summary_shows_the_funding_hurdle(root):
+    d = build_summary(root)
+    assert d["funding"]["net"] == pytest.approx(d["equity"] - d["initial"] - d["funding"]["total"])
+    assert d["funding"]["break_even"] > d["initial"]

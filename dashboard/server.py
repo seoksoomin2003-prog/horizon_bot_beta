@@ -31,6 +31,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from paper import settings as paper_settings  # noqa: E402  standard library only
+from paper import funding  # noqa: E402  standard library only
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8791
@@ -39,7 +40,7 @@ TAIL_BYTES = 256 * 1024
 STALE_AFTER_SECONDS = 300
 MAX_FILLS = 100
 MAX_LOG_LINES = 30
-ACTIVITY = re.compile(r"\[(ENTRY APPROVED|ENTRY ABORTED[^\]]*|EXIT ENGINE|TIMEOUT|STARTUP|ORDER_IN_FLIGHT|MIN_ORDER|SKIPPED: PAPER_RULES)\]|COOLDOWN ACTIVATED")
+ACTIVITY = re.compile(r"\[(ENTRY APPROVED|ENTRY ABORTED[^\]]*|EXIT ENGINE|TIMEOUT|STARTUP|ORDER_IN_FLIGHT|MIN_ORDER|SKIPPED: PAPER_RULES|REJECTED: SLIPPAGE|SLIPPAGE)\]|COOLDOWN ACTIVATED")
 MAX_BODY = 4096
 CONTROL_TIMEOUT = 60
 LOG_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ - \S+ - ([A-Z]+) - (.*)$")
@@ -184,6 +185,7 @@ def build_summary(root: Path, cache: Optional[dict] = None, now: Optional[float]
     result.update({
         "initial": initial, "cash": state["cash"], "return": state["cash"] / initial - 1, "realized": state["realized"],
         "equity": state["cash"] + unrealized_total, "marks_ms": state.get("marks_ms"),
+        "funding": funding.round_trip(initial, state["cash"] + unrealized_total),
         "fees": state["fees"], "fills": len(fills), "closes": len(closes), "wins": len(wins),
         "win_rate": len(wins) / len(closes) if closes else None, "drawdown": drawdown, "positions": positions,
         "open_orders": len(orders), "curve": curve, "first_ms": fills[0]["timestamp"] if fills else None,
