@@ -114,6 +114,28 @@ button:disabled { opacity: .5; cursor: default; }
       <div><dt>시장 대비 4시간 확신 상위 10%</dt><dd id="predrel4conf">-</dd></div>
     </dl>
     <p class="label" id="prednote"></p>
+    <h2 class="spaced">코인 조회 <span class="label" id="coinwhen"></span></h2>
+    <label class="field"><span>코인 (예측 기록기가 다루는 코인)</span><select id="coinpick"></select></label>
+    <dl class="kpis spaced">
+      <div><dt>가격</dt><dd id="coinprice">-</dd></div>
+      <div><dt>4시간 뒤 오를 확률</dt><dd id="coinp4">-</dd></div>
+      <div><dt>4시간 확신 순위</dt><dd id="coinrank4">-</dd></div>
+      <div><dt>8시간 뒤 오를 확률</dt><dd id="coinp8">-</dd></div>
+      <div><dt>8시간 확신 순위</dt><dd id="coinrank8">-</dd></div>
+    </dl>
+    <p class="label" id="coinnote"></p>
+    <div class="buttons spaced">
+      <button id="coinnow" type="button">지금 시세로 예측</button>
+    </div>
+    <div class="message label" id="nowmessage" role="status"></div>
+    <dl class="kpis spaced">
+      <div><dt>지금 가격</dt><dd id="nowprice">-</dd></div>
+      <div><dt>지금부터 4시간 뒤 오를 확률</dt><dd id="nowp4">-</dd></div>
+      <div><dt>4시간 확신 순위</dt><dd id="nowrank4">-</dd></div>
+      <div><dt>지금부터 8시간 뒤 오를 확률</dt><dd id="nowp8">-</dd></div>
+      <div><dt>8시간 확신 순위</dt><dd id="nowrank8">-</dd></div>
+    </dl>
+    <p class="label" id="nownote"></p>
     <h2 class="spaced">최근 예측 <span class="label" id="predlatest"></span></h2>
     <div class="scroll"><table>
       <thead><tr><th>코인</th><th class="num">가격</th><th class="num">상승 확률</th><th>예측</th><th class="num">예상 이익</th><th>확신 상위 10%</th><th class="num">8시간 상승 확률</th><th class="num">8시간 중간 코인보다 오를 확률</th></tr></thead>
@@ -295,6 +317,86 @@ $("predstart").addEventListener("click", () => sendPredictor("predictor_start"))
 $("predstop").addEventListener("click", () => sendPredictor("predictor_stop"));
 const ratio = (k, n) => n ? `${pct(k / n, 1)} (${k}/${n})` : "없음";
 const dirText = (p) => p > 0.5 ? "오름" : "내림";
+let coinList = [];
+function showCoin() {
+  const c = coinList.find((x) => x.symbol === $("coinpick").value);
+  const n = coinList.length;
+  const flag = (top10, top5) => (top5 ? " · 상위 5%" : top10 ? " · 상위 10%" : "");
+  $("coinwhen").textContent = c ? `${when(c.close_ms)} 마감 기준` : "";
+  $("coinprice").textContent = c ? price(c.price) : "-";
+  $("coinp4").textContent = c ? `${pct(c.p_up, 1)} (${dirText(c.p_up)})` : "-";
+  $("coinrank4").textContent = c ? `${n}개 중 ${c.rank}위${flag(c.confident, c.top5)}` : "-";
+  $("coinp8").textContent = c && c.p_up_8h != null ? `${pct(c.p_up_8h, 1)} (${dirText(c.p_up_8h)})` : "-";
+  $("coinrank8").textContent = c && c.rank_8h != null ? `${n}개 중 ${c.rank_8h}위${flag(c.confident_8h, c.top5_8h)}` : "-";
+  $("coinnote").textContent = n
+    ? "확신 순위는 확률이 50%에서 멀수록 높습니다. 1위가 가장 확신이 큰 예측이고, 오른다는 쪽과 내린다는 쪽을 함께 줄 세웁니다. 연구에서 적중률이 50%보다 뚜렷이 높았던 것은 상위 10% 표시가 붙은 예측뿐입니다. 순위가 낮은 예측은 동전 던지기에 가깝습니다."
+    : "아직 예측이 없습니다. 예측 기록을 켜면 다음 4시간봉 마감 때 나옵니다.";
+}
+let nowView = null;
+let nowAsked = false;
+let nowError = "";
+const stamp = (ms) => new Date(ms).toLocaleString("ko-KR", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+function showNow() {
+  const v = nowView || { coins: [] };
+  const c = v.ok ? v.coins.find((x) => x.symbol === $("coinpick").value) : null;
+  const n = v.coins.length;
+  const flag = (top10, top5) => (top5 ? " · 상위 5%" : top10 ? " · 상위 10%" : "");
+  $("nowprice").textContent = c ? price(c.price) : "-";
+  $("nowp4").textContent = c && c.p_up != null ? `${pct(c.p_up, 1)} (${dirText(c.p_up)})` : "-";
+  $("nowrank4").textContent = c && c.rank != null ? `${n}개 중 ${c.rank}위${flag(c.confident, c.top5)}` : "-";
+  $("nowp8").textContent = c && c.p_up_8h != null ? `${pct(c.p_up_8h, 1)} (${dirText(c.p_up_8h)})` : "-";
+  $("nowrank8").textContent = c && c.rank_8h != null ? `${n}개 중 ${c.rank_8h}위${flag(c.confident_8h, c.top5_8h)}` : "-";
+  const waiting = v.pending || nowAsked;
+  $("coinnow").disabled = waiting;
+  let text = "";
+  if (nowError) text = nowError;
+  else if (waiting) text = "계산 중입니다. 코인 60개의 시세를 새로 받느라 1~2분 걸립니다. 화면은 저절로 바뀝니다.";
+  else if (v.ok === false) text = `계산하지 못했습니다. ${v.message}`;
+  else if (v.ok && !c) text = "이 코인은 지금 시세를 받지 못했습니다.";
+  $("nowmessage").textContent = text;
+  $("nowmessage").className = "message label" + (nowError || (v.ok === false && !waiting) ? " bad" : "");
+  $("nownote").textContent = v.ok && v.made_ms
+    ? `${stamp(v.made_ms)}에 받은 시세 기준입니다. 4시간봉 마감이 아닌 시점의 예측은 연구에서 검증한 적이 없어서 적중률을 알 수 없고, 위의 채점 기록에도 넣지 않습니다. 나중에 확인할 수 있게 따로 저장합니다.`
+    : "버튼을 누르면 그 순간의 시세로 60개 코인을 다시 계산합니다. 1분에 한 번까지만 계산합니다.";
+}
+async function askNow() {
+  nowAsked = true;
+  nowError = "";
+  showNow();
+  try {
+    const res = await fetch("/api/control", { method: "POST", headers: { "Content-Type": "application/json", "X-Control-Token": TOKEN },
+      body: JSON.stringify({ action: "predict_now" }) });
+    const out = await res.json().catch(() => ({ ok: false, message: `요청 실패 (${res.status})` }));
+    if (!out.ok) nowError = out.message;
+  } catch (err) {
+    nowError = "화면 서버와 연결하지 못했습니다.";
+  }
+  await pollNow();
+}
+async function pollNow() {
+  await refresh();
+  nowAsked = false;       // from here on the server says whether an answer is still awaited
+  showNow();
+  if (nowView && nowView.pending) setTimeout(pollNow, 3000);
+}
+$("coinnow").addEventListener("click", askNow);
+function renderCoin(coins) {
+  const pick = $("coinpick");
+  const names = coins.map((c) => c.symbol);
+  if (names.join() !== coinList.map((c) => c.symbol).join()) {
+    let saved = pick.value;
+    try { saved = saved || localStorage.getItem("coin") || ""; } catch (e) { /* storage blocked: start from the first coin */ }
+    pick.replaceChildren(...names.map((name) => { const o = document.createElement("option"); o.value = name; o.textContent = sym(name); return o; }));
+    if (names.includes(saved)) pick.value = saved;
+  }
+  coinList = coins;
+  showCoin();
+}
+$("coinpick").addEventListener("change", () => {
+  try { localStorage.setItem("coin", $("coinpick").value); } catch (e) { /* storage blocked: the choice lasts until reload */ }
+  showCoin();
+  showNow();
+});
 function renderPredictions(q) {
   if (!q) return;
   let text = q.running ? "켜져 있음" : "꺼져 있음";
@@ -325,6 +427,9 @@ function renderPredictions(q) {
   $("prednote").textContent = (margin == null ? "아직 채점된 예측이 없습니다. " : `지금 표본으로는 적중률이 우연만으로도 약 ±${(margin * 100).toFixed(1)}%p 흔들립니다. `)
     + "연구(v7)에서 처음 보는 코인의 확신 상위 10% 적중률은 4시간 55.9%, 8시간 57.5%, 8시간 상위 5%는 58.7%였습니다. 다만 최근 9개월은 그보다 낮았고, 실제로 수익이 나는지는 확인되지 않았습니다. 시장 대비 예측은 그 코인이 60개 코인의 중간보다 더 오를지를 맞히는 것으로, 연구(v9)에서 처음 보는 코인의 확신 상위 10%가 4시간 57.2%, 8시간 58.5%였고 다섯 해 모두 55%를 넘었습니다. 이것도 적중률일 뿐 수익을 뜻하지 않습니다."
     + (q.collected ? ` 이번 실행에서 수집한 연구용 데이터: 미결제약정·롱숏 비율 ${q.collected.positioning}행, 호가 ${q.collected.orderbook}행, 강제청산 ${q.collected.liquidations}건.` : "");
+  renderCoin(q.coins || []);
+  if (q.now) nowView = q.now;
+  showNow();
   $("predlatest").textContent = q.latest.length ? `${when(q.latest[0].close_ms)} 마감 기준 · 코인 ${q.latest_count}개 중 확신이 큰 ${q.latest.length}개` : "";
   fillRows("predrows", q.latest.map((r) => row([[sym(r.symbol)], [price(r.price), 1], [pct(r.p_up, 1), 1], [dirText(r.p_up)],
     [pct(r.expected_gain), 1], [r.confident ? "예" : ""], [r.p_up_8h == null ? "-" : pct(r.p_up_8h, 1), 1], [r.p_above_8h == null ? "-" : pct(r.p_above_8h, 1), 1]])), "아직 예측이 없습니다. 켜면 다음 4시간봉 마감(한국 시각 1·5·9·13·17·21시) 때 나옵니다.", 8);
@@ -494,9 +599,9 @@ function render(d) {
   $("return").textContent = `시작 자금 ${money(d.initial)} USDT 대비 ${d.return > 0 ? "+" : ""}${pct(d.return)}`;
   $("equity").textContent = money(d.equity);
   const f = d.funding;
-  if (f) $("funding").textContent = `빗썸 ↔ 바이낸스 입출금 왕복 비용 ${money(f.total)} USDT (빗썸 매수 ${money(f.buy_fee)} · 바이낸스로 전송 ${money(f.to_binance)} · 빗썸으로 전송 ${money(f.to_bithumb)} · 빗썸 매도 ${money(f.sell_fee)}). `
+  if (f) $("funding").textContent = `빗썸 ↔ 바이낸스 입출금 왕복 비용 ${money(f.total)} USDT (빗썸 매수 ${money(f.buy_fee)} · 바이낸스로 전송 ${money(f.to_binance)} · 바이낸스 환전 ${money(f.binance_fee)} · 빗썸으로 전송 ${money(f.to_bithumb)} · 빗썸 매도 ${money(f.sell_fee)}). `
     + `이 비용까지 빼면 손익 ${signed(f.net)} USDT. 평가 자산이 ${money(f.break_even)} USDT(시작 자금 대비 +${pct(f.break_even_return)})를 넘어야 본전입니다. `
-    + `테더(USDT)·트론 전송, 빗썸 수수료 ${pct(f.bithumb_fee)} 기준 (${f.checked} 확인). 두 거래소의 가격 차이는 뺐습니다.`;
+    + `리플(XRP) 전송(보낼 때 ${f.to_binance_xrp} XRP, 돌아올 때 ${f.to_bithumb_xrp} XRP, 1 XRP = ${money(f.xrp_price, 4)} USDT), 빗썸 수수료 ${pct(f.bithumb_fee)} 기준 (${f.checked} 확인). 두 거래소의 가격 차이와 전송 중 리플 가격 변동은 뺐습니다.`;
   $("realized").textContent = signed(d.realized);
   $("fees").textContent = money(d.fees);
   $("closes").textContent = `${d.closes}건`;

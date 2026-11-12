@@ -185,7 +185,7 @@ def build_summary(root: Path, cache: Optional[dict] = None, now: Optional[float]
     result.update({
         "initial": initial, "cash": state["cash"], "return": state["cash"] / initial - 1, "realized": state["realized"],
         "equity": state["cash"] + unrealized_total, "marks_ms": state.get("marks_ms"),
-        "funding": funding.round_trip(initial, state["cash"] + unrealized_total),
+        "funding": funding.round_trip(initial, state["cash"] + unrealized_total, result["predictions"].get("xrp_price")),
         "fees": state["fees"], "fills": len(fills), "closes": len(closes), "wins": len(wins),
         "win_rate": len(wins) / len(closes) if closes else None, "drawdown": drawdown, "positions": positions,
         "open_orders": len(orders), "curve": curve, "first_ms": fills[0]["timestamp"] if fills else None,
@@ -222,6 +222,14 @@ def pid_alive(path: Path) -> bool:
         return False
 
 
+def now_view(folder: Path) -> dict:
+    """The predictor's newest "as of now" answer and whether a newer request is still waiting for one."""
+    answer, asked = read_json(folder / "now.json"), read_json(folder / "now_request.json").get("requested_ms") or 0
+    coins = answer.get("coins") if isinstance(answer.get("coins"), list) else []
+    return {"pending": asked > (answer.get("requested_ms") or 0), "requested_ms": asked or None, "ok": answer.get("ok"),
+            "made_ms": answer.get("made_ms"), "message": mask(str(answer.get("message", "")))[:200], "coins": coins}
+
+
 def prediction_summary(root: Path, now_ms: float) -> dict:
     """The live direction predictor's record (predictor/live.py), scored against what happened next."""
     folder = root / "runtime" / "predictor"
@@ -237,7 +245,7 @@ def prediction_summary(root: Path, now_ms: float) -> dict:
     rows, scored, signals, confident = [], [], [], []
     tally = lambda: {"scored": 0, "hits": 0, "confident": 0, "confident_hits": 0, "top5": 0, "top5_hits": 0}
     eight, relative = tally(), {"4h": tally(), "8h": tally()}      # 8-hour predictions; "beats the median coin" predictions
-    eight_p, relative_p = {}, {}
+    eight_p, relative_p, eight_flags = {}, {}, {}
     for p in predicted:
         horizon, kind = p.get("horizon", 1), p.get("kind", "direction")     # older rows are 4-hour direction ones
         o = outcomes.get((p.get("symbol"), p.get("close_ms"), horizon, kind))
@@ -247,6 +255,8 @@ def prediction_summary(root: Path, now_ms: float) -> dict:
                 continue
             if horizon == 2:
                 (eight_p if kind == "direction" else relative_p)[(p.get("symbol"), p.get("close_ms"))] = p.get("p_up")
+                if kind == "direction":
+                    eight_flags[(p.get("symbol"), p.get("close_ms"))] = (bool(p.get("confident")), bool(p.get("top5")))
             answer = None if o is None else o.get("relative_return" if kind == "relative" else "log_return")
             if answer is not None:
                 hit = (p["p_up"] > 0.5) == (answer > 0)
@@ -257,7 +267,7 @@ def prediction_summary(root: Path, now_ms: float) -> dict:
             continue
         row = {"close_ms": p.get("close_ms"), "symbol": p.get("symbol"), "price": p.get("price"), "p_up": p.get("p_up"),
                "expected_gain": p.get("expected_gain"), "signal": bool(p.get("signal")), "confident": bool(p.get("confident")),
-               "next_price": None, "up": None, "hit": None}
+               "top5": bool(p.get("top5")), "next_price": None, "up": None, "hit": None}
         if o is not None:
             up = o["log_return"] > 0
             row.update(next_price=o.get("next_price"), up=up, hit=(p["p_up"] > 0.5) == up)
@@ -274,11 +284,23 @@ def prediction_summary(root: Path, now_ms: float) -> dict:
     latest = sorted((r for r in rows if r["close_ms"] == latest_close), key=lambda r: -abs(r["p_up"] - 0.5))
     latest = [{**r, "p_up_8h": eight_p.get((r["symbol"], r["close_ms"])),
                "p_above_8h": relative_p.get((r["symbol"], r["close_ms"]))} for r in latest]
+    # Every coin at the latest close, for looking one up: its rank is its place among the coins by confidence, 1 = surest.
+    surest_8h = sorted((r for r in latest if r["p_up_8h"] is not None), key=lambda r: -abs(r["p_up_8h"] - 0.5))
+    rank_8h = {r["symbol"]: i + 1 for i, r in enumerate(surest_8h)}
+    coins = []
+    for i, r in enumerate(latest):
+        flags = eight_flags.get((r["symbol"], r["close_ms"]), (False, False))
+        coins.append({"symbol": r["symbol"], "close_ms": r["close_ms"], "price": r["price"], "p_up": r["p_up"], "rank": i + 1,
+                      "confident": r["confident"], "top5": r["top5"], "p_up_8h": r["p_up_8h"], "rank_8h": rank_8h.get(r["symbol"]),
+                      "confident_8h": flags[0], "top5_8h": flags[1]})
     return {
         "running": running, "stale": bool(running and updated and now_ms - updated > PREDICTOR_STALE_MS),
         "updated_ms": updated, "ok": status.get("ok"), "message": mask(str(status.get("message", "")))[:200],
         "model_month": status.get("model_month"), "first_ms": rows[0]["close_ms"] if rows else None,
         "latest": latest[:MAX_LATEST_ROWS], "latest_count": len(latest),
+        "coins": sorted(coins, key=lambda c: c["symbol"]),
+        "now": now_view(folder),
+        "xrp_price": next((r["price"] for r in latest if r["symbol"] == "XRPUSDT"), None),
         "collected": status.get("collected"), "eight": eight, "relative": relative,
         "confident": len(confident), "confident_hits": sum(r["hit"] for r, _ in confident),
         "confident_net": sum(confident_net) / len(confident_net) if confident_net else None,
@@ -336,11 +358,28 @@ def predictor_control(root: Path, action: str, runner=run_script) -> tuple[int, 
         ok, out = runner(root, "stop", script="run_predictor.sh")
         return (200, {"ok": True, "message": "예측 기록기를 껐습니다. 기록은 남아 있습니다."}) if ok else \
                (500, {"ok": False, "message": f"끄지 못했습니다. {out}"})
+    if action == "predict_now":
+        if not running:
+            return 409, {"ok": False, "message": "예측 기록이 꺼져 있습니다. 먼저 켜 주세요."}
+        folder = root / "runtime" / "predictor"
+        folder.mkdir(parents=True, exist_ok=True)
+        tmp = folder / "now_request.tmp"
+        tmp.write_text(json.dumps({"requested_ms": int(time.time() * 1000)}), encoding="utf-8")
+        os.replace(tmp, folder / "now_request.json")
+        return 200, {"ok": True, "message": "지금 시세로 예측을 요청했습니다. 코인 60개의 시세를 새로 받아 계산하느라 1~2분 걸립니다."}
     return 400, {"ok": False, "message": "알 수 없는 요청입니다."}
 
 
+def read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def control(root: Path, action: str, raw_settings: Optional[dict] = None, runner=run_script) -> tuple[int, dict]:
-    if action in ("predictor_start", "predictor_stop"):
+    if action in ("predictor_start", "predictor_stop", "predict_now"):
         return predictor_control(root, action, runner)
     if action == "stop":
         if not is_running(root):

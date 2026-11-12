@@ -1,6 +1,7 @@
 """The live direction predictor: on-time predictions only, scored when the horizon ends, and no orders anywhere."""
 import json
 import math
+import os
 
 import numpy as np
 import pandas as pd
@@ -25,7 +26,7 @@ class FakeMarket:
             self.funding[s] = np.array([[t, 0.0001] for t in range(int(opens[0]), last_close + 1, 8 * 3_600_000)], dtype=float)
         self.updated = []
 
-    def update(self, now_ms):
+    def update(self, now_ms, bars=True):
         self.updated.append(now_ms)
 
     frames = live.Market.frames
@@ -241,3 +242,120 @@ def test_dashboard_scores_relative_predictions_apart(tmp_path):
     assert q["relative"]["8h"] == {"scored": 2, "hits": 1, "confident": 2, "confident_hits": 1, "top5": 1, "top5_hits": 1}
     assert q["relative"]["4h"]["scored"] == 1 and q["relative"]["4h"]["hits"] == 1
     assert q["scored"] == 0 and q["eight"]["scored"] == 0 and q["latest"][0]["p_above_8h"] == 0.7
+
+
+def test_dashboard_lists_every_coin_with_its_confidence_rank(tmp_path):
+    folder = tmp_path / "runtime/predictor"
+    folder.mkdir(parents=True)
+    coin = lambda symbol, p4, p8, **flags8: [
+        {"close_ms": BAR_MS, "symbol": symbol, "price": 1.0, "p_up": p4, "expected_gain": 0.0, "signal": False, "confident": p4 == 0.4},
+        {"close_ms": BAR_MS, "horizon": 2, "symbol": symbol, "price": 1.0, "p_up": p8, **flags8},
+        {"close_ms": BAR_MS, "horizon": 2, "kind": "relative", "symbol": symbol, "price": 1.0, "p_up": 0.99}]
+    write(folder / "predictions.jsonl", [{"close_ms": 0, "symbol": "OLDUSDT", "price": 1.0, "p_up": 0.9, "expected_gain": 0.0, "signal": False}]
+          + coin("CCCUSDT", 0.52, 0.30, confident=True, top5=True) + coin("AAAUSDT", 0.40, 0.55, confident=True) + coin("BBBUSDT", 0.51, 0.49))
+    write(folder / "outcomes.jsonl", [])
+    coins = prediction_summary(tmp_path, now_ms=BAR_MS)["coins"]
+    assert [c["symbol"] for c in coins] == ["AAAUSDT", "BBBUSDT", "CCCUSDT"]        # the latest close only, by name
+    a, b, c = coins
+    assert (a["p_up"], a["rank"], a["confident"], a["p_up_8h"], a["rank_8h"], a["confident_8h"], a["top5_8h"]) == (0.40, 1, True, 0.55, 2, True, False)
+    assert (b["rank"], b["rank_8h"], b["confident"], b["confident_8h"]) == (3, 3, False, False)
+    assert (c["rank"], c["rank_8h"], c["top5_8h"]) == (2, 1, True)                  # the relative rows never count here
+
+
+CANDLE_MS = live.NOW_CANDLE_MS
+
+
+class CandleClient:
+    """15-minute random-walk candles for every coin, newest one still forming; answers the paged klines query."""
+
+    def __init__(self, newest_open: int, n: int = 3200, skip: tuple = ()):
+        rng = np.random.default_rng(5)
+        self.calls, self.candles = [], {}
+        opens = newest_open - CANDLE_MS * np.arange(n - 1, -1, -1)
+        for s in SYMBOLS:
+            if s in skip:
+                continue
+            close = 100 * np.exp(np.cumsum(rng.normal(0, 0.002, n)))
+            self.candles[s] = np.column_stack([opens, close, close * 1.001, close * 0.999, close, rng.uniform(1, 2, n)])
+
+    def fapiPublicGetKlines(self, query):
+        self.calls.append(query)
+        rows = self.candles.get(query["symbol"], np.empty((0, 6)))
+        rows = rows[rows[:, 0] <= query.get("endTime", math.inf)][-query["limit"]:]
+        return [[str(int(r[0]))] + [str(v) for v in r[1:]] for r in rows]
+
+
+def fitted_models(market, now_ms):
+    models = [live.Model(h, relative) for relative in (False, True) for h in live.HORIZONS]
+    for m in models:
+        m.refit_if_needed(m.prepare(market.frames(m.horizon)), now_ms)
+    return models
+
+
+def test_bars_ending_now_count_back_from_the_newest_candle():
+    t = T0 + 5 * CANDLE_MS + CANDLE_MS * np.arange(16 * 3 + 5)       # 3 whole bars and 5 older candles
+    candles = np.column_stack([t, np.arange(len(t)), np.arange(len(t)) + 0.5, np.arange(len(t)) - 0.5, np.arange(len(t)) + 0.1, np.ones(len(t))])
+    bars = live.bars_ending_now(candles)
+    assert len(bars) == 3 and (np.diff(bars[:, 0]) == BAR_MS).all()
+    assert bars[-1, 0] + BAR_MS == t[-1] + CANDLE_MS                 # the last bar ends when the forming candle will
+    assert list(bars[-1, 1:]) == [candles[-16, 1], candles[-1, 2], candles[-16, 3], candles[-1, 4], 16.0]
+    holed = np.delete(candles, np.s_[-20:-18], axis=0)               # two candles missing in the middle bar
+    assert len(live.bars_ending_now(holed)) == 3 and live.bars_ending_now(holed)[1, 5] == 14.0
+
+
+def test_as_of_now_prediction_ranks_every_coin_on_bars_that_end_now(tmp_path):
+    now = T0 + 7 * CANDLE_MS + 123_000                               # in the middle of a 4h bar and of a 15m candle
+    market = FakeMarket(T0, n=1200)
+    models = fitted_models(market, now)
+    market.client = CandleClient(now // CANDLE_MS * CANDLE_MS, skip=("ETHUSDT",))
+    result = live.predict_now(market, models, now, clock=lambda: now / 1000 + 20)
+    coins = {c["symbol"]: c for c in result["coins"]}
+    assert result["ok"] and result["made_ms"] == now + 20_000
+    assert result["end_ms"] == now // CANDLE_MS * CANDLE_MS + CANDLE_MS and result["end_ms"] % BAR_MS != 0
+    assert set(coins) == set(SYMBOLS) - {"ETHUSDT"}                  # a coin without candles is left out, not guessed
+    assert sorted(c["rank"] for c in coins.values()) == list(range(1, len(coins) + 1))
+    assert sorted(c["rank_8h"] for c in coins.values()) == list(range(1, len(coins) + 1))
+    first = next(c for c in coins.values() if c["rank"] == 1)
+    assert all(abs(first["p_up"] - 0.5) >= abs(c["p_up"] - 0.5) for c in coins.values())
+    btc = coins["BTCUSDT"]
+    assert btc["price"] == market.client.candles["BTCUSDT"][-1, 4]   # the forming candle's price
+    assert 0 < btc["p_up"] < 1 and 0 < btc["p_up_8h"] < 1 and isinstance(btc["confident"], bool)
+    assert all(q["interval"] == "15m" for q in market.client.calls) and market.updated == [now]
+
+
+def test_as_of_now_request_is_answered_once_and_never_scored(tmp_path):
+    now = T0 + 7 * CANDLE_MS
+    market = FakeMarket(T0, n=1200)
+    models = fitted_models(market, now)
+    market.client = CandleClient(now // CANDLE_MS * CANDLE_MS)
+    clock = lambda: now / 1000
+    assert not live.serve_now(market, models, tmp_path, clock)       # nothing was asked
+    write(tmp_path / "now_request.json", [{"requested_ms": now - 1000}])
+    assert live.serve_now(market, models, tmp_path, clock)
+    answer = json.loads((tmp_path / "now.json").read_text())
+    assert answer["ok"] and answer["requested_ms"] == now - 1000 and len(answer["coins"]) == len(SYMBOLS)
+    assert not live.serve_now(market, models, tmp_path, clock)       # the same request is not answered twice
+    write(tmp_path / "now_request.json", [{"requested_ms": now}])
+    assert not live.serve_now(market, models, tmp_path, clock)       # a new one within a minute waits
+    assert live.serve_now(market, models, tmp_path, lambda: now / 1000 + 61)
+    assert len(live.read_jsonl(tmp_path / "now_predictions.jsonl")) == 2 * len(SYMBOLS)
+    assert not (tmp_path / "predictions.jsonl").exists()             # kept apart from the scored record
+    market.client = None                                             # the exchange cannot be reached
+    write(tmp_path / "now_request.json", [{"requested_ms": now + 200_000}])
+    assert live.serve_now(market, models, tmp_path, lambda: now / 1000 + 300)
+    assert json.loads((tmp_path / "now.json").read_text())["ok"] is False
+
+
+def test_dashboard_asks_for_an_as_of_now_prediction_only_while_the_predictor_runs(tmp_path):
+    from dashboard.server import now_view
+    status, out = control(tmp_path, "predict_now", runner=lambda *a, **k: (_ for _ in ()).throw(AssertionError("runs no script")))
+    assert status == 409 and not out["ok"] and not (tmp_path / "runtime/predictor/now_request.json").exists()
+    (tmp_path / ".run").mkdir()
+    (tmp_path / ".run/predictor.pid").write_text(str(os.getpid()))
+    status, out = control(tmp_path, "predict_now", runner=lambda *a, **k: (_ for _ in ()).throw(AssertionError("runs no script")))
+    folder = tmp_path / "runtime/predictor"
+    asked = json.loads((folder / "now_request.json").read_text())["requested_ms"]
+    assert status == 200 and out["ok"] and now_view(folder)["pending"]
+    (folder / "now.json").write_text(json.dumps({"requested_ms": asked, "ok": True, "made_ms": asked + 5, "coins": [{"symbol": "BTCUSDT", "p_up": 0.6}]}))
+    view = now_view(folder)
+    assert not view["pending"] and view["ok"] and view["coins"][0]["symbol"] == "BTCUSDT"

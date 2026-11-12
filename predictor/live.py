@@ -15,6 +15,10 @@ year (docs/research/direction_result_v9.md). BTCDOMUSDT, an index product, is le
 
 Each model refits on the first of every month on rows whose answer was known by then, exactly as in the research.
 
+On request from the dashboard it also predicts "as of now" (predict_now): the same direction models on 4-hour bars
+that end at this moment instead of at a scheduled close. The research only ever tested scheduled closes, so these
+are shown apart, never mixed into the score, and saved in now_predictions.jsonl so they can be checked later.
+
   .venv/bin/python -m predictor.live         (normally through ./run_predictor.sh)
 """
 
@@ -43,6 +47,9 @@ HORIZONS = (1, 2)              # bars ahead: 4 hours and 8 hours
 NOT_RELATIVE = {"BTCDOMUSDT"}   # an index product: no part of the median coin (v9)
 MAX_LATE_MS = 15 * 60_000
 WAKE_AFTER_CLOSE_MS = 60_000
+NOW_CANDLE_MS = 15 * 60_000     # "as of now" bars are built from 15-minute candles
+NOW_PAGES = 2                   # 3,000 candles: 31 days, enough for the 28-day feature
+NOW_MIN_GAP_MS = 60_000         # at most one "as of now" run a minute, whatever is asked
 
 
 def append(path: Path, rows: list[dict]) -> None:
@@ -96,7 +103,8 @@ class Market:
             np.save(self.dir / name, rows)
         return rows
 
-    def update(self, now_ms: int) -> None:
+    def update(self, now_ms: int, bars: bool = True) -> None:
+        """Tops up the funding rates and, unless `bars` is off, the completed 4h bars."""
         for symbol in self.symbols:
             if symbol not in self.bars:
                 self.bars[symbol] = self._load(f"{symbol}.bars.npy", 6)
@@ -105,8 +113,9 @@ class Market:
                                 self.client.fapiPublicGetKlines({"symbol": symbol, "interval": "4h", "startTime": c, "limit": 1500})]
             rates = lambda c: [[int(r["fundingTime"]), float(r["fundingRate"])] for r in
                                self.client.fapiPublicGetFundingRate({"symbol": symbol, "startTime": c, "limit": 1000})]
-            self.bars[symbol] = self._top_up(f"{symbol}.bars.npy", self.bars[symbol], klines, now_ms,
-                                             lambda r: r[0] + BAR_MS <= now_ms)       # completed bars only
+            if bars:
+                self.bars[symbol] = self._top_up(f"{symbol}.bars.npy", self.bars[symbol], klines, now_ms,
+                                                 lambda r: r[0] + BAR_MS <= now_ms)   # completed bars only
             self.funding[symbol] = self._top_up(f"{symbol}.funding.npy", self.funding[symbol], rates, now_ms, lambda r: True)
 
     def frames(self, horizon: int = 1) -> pd.DataFrame:
@@ -227,6 +236,79 @@ def cycle(market: Market, models: list[Model], directory: Path, now_ms: int, clo
     return next((m for m in messages if m.startswith("predicted")), messages[0])     # the first model predicts every coin
 
 
+def bars_ending_now(candles: np.ndarray) -> np.ndarray:
+    """4h bars counted back from the newest candle, so the last bar ends now. Rows in and out are
+    [open_ms, open, high, low, close, volume]; the newest candle is still forming and its close is the current price.
+    The oldest bar is dropped when it is not whole. A gap in the candles leaves a gap in the bars."""
+    c = pd.DataFrame(candles, columns=["t", "o", "h", "l", "c", "v"]).sort_values("t")
+    end = int(c["t"].iloc[-1]) + NOW_CANDLE_MS
+    c["back"] = (end - 1 - c["t"].astype(np.int64)) // BAR_MS       # 0 is the bar that ends now
+    bars = c.groupby("back").agg(o=("o", "first"), h=("h", "max"), l=("l", "min"), c=("c", "last"), v=("v", "sum"), n=("t", "size"))
+    bars = bars[(bars["n"] == BAR_MS // NOW_CANDLE_MS) | (bars.index < bars.index.max())].sort_index(ascending=False)
+    return np.column_stack([end - (bars.index.to_numpy() + 1) * BAR_MS, bars[["o", "h", "l", "c", "v"]].to_numpy()])
+
+
+def predict_now(market: Market, models: list[Model], now_ms: int, clock=time.time) -> dict:
+    """Every coin's 4h and 8h direction probability on bars that end now, with its place by confidence (1 = surest)."""
+    market.update(now_ms, bars=False)       # the newest funding rates; the bars here come from 15m candles
+    bars = {}
+    for symbol in market.symbols:
+        rows, before = [], None
+        for _ in range(NOW_PAGES):
+            query = {"symbol": symbol, "interval": "15m", "limit": 1500, **({"endTime": before} if before else {})}
+            page = [[int(r[0])] + [float(v) for v in r[1:6]] for r in market.client.fapiPublicGetKlines(query)]
+            if not page:
+                break
+            rows, before = page + rows, page[0][0] - 1
+        if rows:
+            bars[symbol] = bars_ending_now(np.array(rows, dtype=float))
+    if "BTCUSDT" not in bars:
+        raise RuntimeError("no BTCUSDT candles")
+    end = max(int(b[-1, 0]) + BAR_MS for b in bars.values())
+    btc = frame("BTCUSDT", bars["BTCUSDT"], market.funding["BTCUSDT"], None, 1).set_index("close_ms")[["r1", "r6"]]
+    data = pd.concat([frame(s, b, market.funding[s], None if s == "BTCUSDT" else btc, 1) for s, b in bars.items()], ignore_index=True)
+    data = data[data["close_ms"] == end]
+    coins = {s: {"symbol": s, "price": float(b[-1, 4])} for s, b in bars.items() if int(b[-1, 0]) + BAR_MS == end}
+    for model in models:
+        if model.relative or model.month is None:
+            continue
+        rows = data.dropna(subset=model.features + ["sd42"])
+        p = model.predict(rows)
+        suffix = "" if model.horizon == 1 else f"_{4 * model.horizon}h"
+        for place, i in enumerate(np.argsort(-np.abs(p - 0.5)), start=1):
+            sure = abs(p[i] - 0.5)
+            coins[rows["symbol"].iloc[i]].update({f"p_up{suffix}": float(p[i]), f"rank{suffix}": place,
+                                                  f"confident{suffix}": bool(sure >= model.thr), f"top5{suffix}": bool(sure >= model.thr95)})
+    done = sorted((c for c in coins.values() if "p_up" in c), key=lambda c: c["symbol"])
+    if not done:
+        raise RuntimeError("the models are not ready yet; they are fitted at the first 4-hour close after starting")
+    return {"ok": True, "made_ms": int(clock() * 1000), "end_ms": end, "coins": done}
+
+
+def serve_now(market: Market, models: list[Model], directory: Path, clock=time.time) -> bool:
+    """Answers the dashboard's newest "as of now" request, if one is waiting. True when it wrote an answer."""
+    try:
+        asked = int(json.loads((directory / "now_request.json").read_text(encoding="utf-8"))["requested_ms"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    try:
+        last = json.loads((directory / "now.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        last = {}
+    now = int(clock() * 1000)
+    if last.get("requested_ms", 0) >= asked or now - last.get("made_ms", 0) < NOW_MIN_GAP_MS:
+        return False
+    try:
+        result = predict_now(market, models, now, clock)
+        append(directory / "now_predictions.jsonl", [{**c, "made_ms": result["made_ms"], "end_ms": result["end_ms"]} for c in result["coins"]])
+    except Exception as e:      # network or exchange trouble: tell the screen instead of leaving it waiting
+        result = {"ok": False, "made_ms": int(clock() * 1000), "message": f"{type(e).__name__}: {str(e)[:200]}"}
+    tmp = directory / "now.tmp"
+    tmp.write_text(json.dumps({"requested_ms": asked, **result}), encoding="utf-8")
+    os.replace(tmp, directory / "now.json")
+    return True
+
+
 def collect_symbols() -> list[str]:
     """The original 10 coins plus the 50 from the v6 research, when that list has been chosen."""
     try:
@@ -267,7 +349,9 @@ def main() -> int:
                      collected=collector.counts)
         wake = (now // BAR_MS + 1) * BAR_MS + WAKE_AFTER_CLOSE_MS
         while time.time() * 1000 < wake:        # short sleeps follow the wall clock across laptop sleep
-            time.sleep(30)
+            time.sleep(5)
+            if serve_now(market, models, DIR):
+                print(time.strftime("%F %T"), "answered an as-of-now request", flush=True)
 
 
 if __name__ == "__main__":

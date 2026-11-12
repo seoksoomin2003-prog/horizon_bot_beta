@@ -283,14 +283,17 @@ def test_past_runs_list_archived_records(root):
 
 def test_funding_round_trip_adds_every_fee_on_the_way_in_and_out():
     from paper import funding
-    r = funding.round_trip(50.0, 60.0, fee=0.0025)
-    assert r["buy_fee"] == pytest.approx(0.125) and r["to_binance"] == funding.TO_BINANCE_USDT
-    assert r["to_bithumb"] == funding.TO_BITHUMB_USDT and r["sell_fee"] == pytest.approx((60.0 - funding.TO_BITHUMB_USDT) * 0.0025)
-    assert r["total"] == pytest.approx(r["buy_fee"] + r["to_binance"] + r["to_bithumb"] + r["sell_fee"])
+    r = funding.round_trip(50.0, 60.0, xrp_price=2.0, fee=0.0025)
+    assert r["to_binance"] == pytest.approx(0.8) and r["to_bithumb"] == pytest.approx(0.4)       # 0.4 and 0.2 XRP at 2 USDT
+    assert r["binance_fee"] == pytest.approx(50.0 / 0.999 - 50.0 + 60.0 * 0.001)                # XRP sold, then bought back
+    assert r["buy_fee"] == pytest.approx((50.0 / 0.999 + 0.8) * 0.0025)
+    assert r["sell_fee"] == pytest.approx((60.0 * 0.999 - 0.4) * 0.0025)
+    assert r["total"] == pytest.approx(sum(r[k] for k in ("buy_fee", "to_binance", "binance_fee", "to_bithumb", "sell_fee")))
     assert r["net"] == pytest.approx(60.0 - 50.0 - r["total"])                     # trading profit minus the trip's costs
-    even = funding.round_trip(50.0, r["break_even"], fee=0.0025)
-    assert even["net"] == pytest.approx(0.0, abs=1e-9) and r["break_even"] > 50.0 + funding.TO_BITHUMB_USDT
-    assert funding.round_trip(50.0, 1.0)["back"] == 0.0                              # less than the transfer fee: nothing arrives
+    even = funding.round_trip(50.0, r["break_even"], xrp_price=2.0, fee=0.0025)
+    assert even["net"] == pytest.approx(0.0, abs=1e-9) and r["break_even"] > 50.0 + 1.2
+    assert funding.round_trip(50.0, 0.1, xrp_price=2.0)["back"] == 0.0             # less than the transfer fee: nothing arrives
+    assert funding.round_trip(50.0, 50.0, xrp_price=None)["xrp_price"] == funding.XRP_PRICE      # no fresh price: the saved one
 
 
 def test_summary_shows_the_funding_hurdle(root):
