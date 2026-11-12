@@ -841,3 +841,27 @@ def test_stop_replaced_by_a_partial_close_is_recorded(tmp_path, tp_action, fille
     assert state.sl_plan_id == "NEW"
     assert state.stop_loss == (100.0 if filled_event == "TP1_FILLED" else 95.0)
     owner.submit_event("POSITION_CLOSED", {})
+
+
+def test_book_slippage_is_the_average_fill_against_the_mid_price():
+    from utils.invariants_v2 import InvariantsV2
+    book = {"bids": [[99.0, 1.0], [98.0, 5.0]], "asks": [[101.0, 1.0], [103.0, 5.0]]}       # mid 100
+    assert InvariantsV2.book_slippage(book, "LONG", 1.0) == pytest.approx(0.01)
+    assert InvariantsV2.book_slippage(book, "LONG", 2.0) == pytest.approx(0.02)          # half at 101, half at 103
+    assert InvariantsV2.book_slippage(book, "SHORT", 2.0) == pytest.approx(0.015)        # half at 99, half at 98
+    assert InvariantsV2.book_slippage(book, "LONG", 6.5) is None                          # more than the book shows
+    for unreadable in (None, {}, {"bids": [], "asks": []}, {"bids": [[99.0, 1.0]], "asks": [["x"]]}):
+        assert InvariantsV2.book_slippage(unreadable, "LONG", 1.0) is None
+
+
+@pytest.mark.parametrize("book", [
+    {"bids": [[99.9, 10.0]], "asks": [[100.1, 0.01], [101.5, 10.0]]},      # fills about 1.5% above the mid price
+    {"bids": [[99.9, 10.0]], "asks": [[100.1, 0.2]]},                      # cannot absorb the order
+    None,                                                                   # the exchange gave no book
+])
+def test_entry_beyond_the_slippage_limit_sends_no_order(allow_entries, book):
+    p, lease_for = _entry_pipeline()
+    p.dh.fetch_orderbook.return_value = book
+    p._process_single_entry("AAAUSDT", MagicMockAccount(), lease_for("AAAUSDT"))
+    p.execution.execute_firm_order.assert_not_called()
+    assert p.risk.trade_timestamps == [] and p.risk_rejection_count == 1     # no slot of the minute limit was used

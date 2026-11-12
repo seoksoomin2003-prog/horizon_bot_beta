@@ -80,9 +80,10 @@ class ReplayFeed:
                 "high": last, "low": last, "baseVolume": 0.0, "quoteVolume": 0.0, "info": {}}
 
     def fetch_order_book(self, symbol: str, limit=None) -> dict:
-        """No past order books exist. A balanced book leaves the imbalance score at zero and adds no spread penalty."""
+        """No past order books exist. A balanced book leaves the imbalance score at zero and adds no spread penalty,
+        and it is deep enough that the order-book slippage limit never refuses an entry."""
         last = self.fetch_ticker(symbol)["last"]
-        return {"bids": [[last, 1.0]], "asks": [[last, 1.0]]}
+        return {"bids": [[last, 1e12]], "asks": [[last, 1e12]]}
 
     def fetch_ohlcv(self, symbol: str, timeframe: str = "1m", since=None, limit=None) -> list:
         s = _bare(symbol)

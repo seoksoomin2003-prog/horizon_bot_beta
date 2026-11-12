@@ -671,6 +671,15 @@ class Pipeline:
                     trades_logger.info(f"[SKIPPED: TOO SMALL] {symbol} {conviction.side} Size: {order_request.amount}")
                     return
 
+                # Hard slippage limit, measured on the order book for this order's size. An order that cannot be bounded is not sent.
+                book_slip = InvariantsV2.book_slippage(ob, conviction.side, order_request.amount)
+                slip_limit = config.SYMBOL_OVERRIDES.get(symbol, {}).get("max_slippage_pct", config.MAX_SLIPPAGE_PCT)
+                if book_slip is None or book_slip > slip_limit:
+                    self.risk_rejection_count += 1
+                    measured = "order book missing or too thin for the size" if book_slip is None else f"{book_slip:.3%} expected"
+                    trades_logger.info(f"[REJECTED: SLIPPAGE] {symbol} {conviction.side}: {measured}, limit {slip_limit:.3%}, no order sent")
+                    return
+
                 if not self.risk.reserve_entry_slot():
                     self.risk_rejection_count += 1
                     trades_logger.info(f"[REJECTED: RATE_LIMIT] {symbol}: entry limit per minute reached")
@@ -691,6 +700,10 @@ class Pipeline:
                 new_pos = self.execution.execute_firm_order(order_request)
                 
                 if new_pos:
+                    entry_fill = SafeCore.float(getattr(new_pos, "entry_price", 0.0))
+                    if entry_fill > 0 and ticker.last > 0:
+                        paid = (entry_fill / ticker.last - 1) * (1 if conviction.side == 'LONG' else -1)
+                        trades_logger.info(f"[SLIPPAGE] {symbol} {conviction.side}: filled {paid:+.3%} from the decision price (book estimate {book_slip:.3%})")
                     new_pos.candles_held = 0
                     new_pos.atr = float(atr or 0.0)
                     # Positions are re-projected from events, so the entry ATR must be an event too.

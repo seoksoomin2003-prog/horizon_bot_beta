@@ -42,6 +42,29 @@ class InvariantsV2:
         return True
 
     @staticmethod
+    def book_slippage(orderbook: Dict[str, Any], side: str, amount: float):
+        """
+        [M3] How far a market order of `amount` would fill from the mid price, as a fraction (0.001 = 0.1%).
+        Walks the asks for a LONG and the bids for a SHORT. Returns None when the book cannot be read or the
+        levels shown cannot absorb the whole order, so the caller can refuse an order it cannot bound.
+        """
+        try:
+            bids, asks = orderbook['bids'], orderbook['asks']
+            mid = (safe_float(bids[0][0]) + safe_float(asks[0][0])) / 2
+            left, cost = float(amount), 0.0
+            for level in (asks if side == 'LONG' else bids):
+                take = min(left, safe_float(level[1]))
+                cost += take * safe_float(level[0])
+                left -= take
+                if left <= 0:
+                    break
+            if left > 0 or mid <= 0 or amount <= 0 or cost <= 0:
+                return None
+            return abs(cost / amount / mid - 1)
+        except (TypeError, KeyError, IndexError, ValueError):
+            return None
+
+    @staticmethod
     def audit_obi(orderbook: Dict[str, Any], threshold: float = 0.8) -> float:
         """
         [M2] OBI Guard: Orderbook Imbalance.
