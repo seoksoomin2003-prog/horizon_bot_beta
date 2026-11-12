@@ -1,6 +1,7 @@
 """Direction model for docs/research/direction_preregistration_v3.md (v4: fixed bet threshold, v5: order-flow and basis
 features, v6: external features and transfer, v7: limit-order fills, positioning and market-relative features,
-v8: stricter fills and per-decision-time baskets, v9: direction relative to the median coin).
+v8: stricter fills and per-decision-time baskets, v9: direction relative to the median coin, v10: weights that
+change with the market's state).
 Parameters are fixed in those documents; do not tune."""
 
 from __future__ import annotations
@@ -30,6 +31,8 @@ M5_MS = 300_000
 MAKER_COST = 0.0002         # v7: the exchange's base limit-order fee per side
 FILL_BARS = 6               # v7: a limit order waits 30 minutes
 BASKET_CAP = 10             # v8: a trade gets at most a tenth of the capital
+REGIMES = ["up_calm", "up_wild", "down_calm", "down_wild"]      # v10
+REGIME_WINDOW = 360         # v10: "usual" volatility is the median of the last 360 closes (60 days)
 
 
 def _funding_sum(fts: np.ndarray, cum: np.ndarray, start: np.ndarray, end: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -152,6 +155,30 @@ def add_relative(data: pd.DataFrame, reference: set[str]) -> pd.DataFrame:
     out["fwd_abs"] = out["fwd"]
     out["fwd"] = out["fwd"] - median("fwd")
     return out
+
+
+def add_regime(data: pd.DataFrame, reference: set[str], features: list[str]) -> tuple[pd.DataFrame, list[str]]:
+    """v10: lets every weight differ by the market's state. Returns the data and the names of the added columns.
+
+    The state at a close comes from the reference coins at that close and earlier, nothing later: "up" when their
+    median 7-day return is above zero, "wild" when their median volatility is above its own median over the last
+    REGIME_WINDOW closes. Each state gets a 0/1 column and a copy of every feature that is zero outside that state,
+    so the fit can move a weight in one state while the penalty pulls it back toward the shared weight.
+    """
+    out = data.copy()
+    market = out[out["symbol"].isin(reference)].groupby("close_ms")[["r42", "vol"]].median().sort_index()
+    usual = market["vol"].rolling(REGIME_WINDOW, min_periods=REGIME_WINDOW).median()
+    state = pd.Series(np.where(market["r42"] > 0, 0, 2) + np.where(market["vol"] > usual, 1, 0), index=market.index, dtype=float)
+    out["regime"] = out["close_ms"].map(state.where(usual.notna() & market["r42"].notna()))
+    names = []
+    for k, name in enumerate(REGIMES):
+        on = (out["regime"] == k).astype(float).where(out["regime"].notna())
+        out[f"is_{name}"] = on
+        names.append(f"is_{name}")
+        for f in features:
+            out[f"{f}@{name}"] = out[f] * on
+            names.append(f"{f}@{name}")
+    return out, names
 
 
 def fill_windows(m5: np.ndarray) -> pd.DataFrame:
