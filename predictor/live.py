@@ -15,6 +15,11 @@ coin over the same 4 or 8 hours. Besides the direction features it sees where ea
 (docs/research/direction_result_v11.md). BTCDOMUSDT, an index product, is left out of it. Every row carries the
 model's `version`, so a score can leave out predictions made by an earlier model.
 
+A third kind, "size", is v14's "how much": for the 30 largest coins, the predicted return over the median coin's over
+8 hours, 24 hours, 3 days and 7 days (one ridge model per period), each scored when its period ends. They are kept
+apart in size_predictions.jsonl and size_outcomes.jsonl. In the research the coins it rated highest did gain more on
+average, but no way of trading it passed the profit test (docs/research/direction_result_v14.md).
+
 Each model refits on the first of every month on rows whose answer was known by then, exactly as in the research.
 
 On request from the dashboard it also predicts "as of now" (predict_now): the same direction models on 4-hour bars
@@ -40,7 +45,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from research.direction import (ABS_MOVE, CLIP, FEATURES, MARKET_FEATURES, RANK_FEATURES, add_ranks, add_relative, fit,  # noqa: E402
                                 frame, predict)
-from research.h4_data import BAR_MS, DEV_START_MS, SYMBOLS, V6_DIR, V6_SYMBOLS_FILE, WARMUP_START_MS, _pages  # noqa: E402
+from research.h4_data import BAR_MS, DEV_START_MS, SYMBOLS, V6_DIR, V6_SYMBOLS_FILE, VAL_END_MS, WARMUP_START_MS, _pages  # noqa: E402
+from research import size_model  # noqa: E402
 from predictor.collect import Collector  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -48,6 +54,7 @@ DIR = ROOT / "runtime" / "predictor"
 SIGNAL_GAIN = 0.005             # v4's fixed bet threshold: expected gain above 0.5%
 HORIZONS = (1, 2)              # bars ahead: 4 hours and 8 hours
 NOT_RELATIVE = {"BTCDOMUSDT"}   # an index product: no part of the median coin (v9)
+SIZE_COINS = 30                 # v14: sizes are recorded for the 30 largest coins by turnover in the year before VAL_END_MS
 MAX_LATE_MS = 15 * 60_000
 WAKE_AFTER_CLOSE_MS = 60_000
 NOW_CANDLE_MS = 15 * 60_000     # "as of now" bars are built from 15-minute candles
@@ -127,6 +134,10 @@ class Market:
                           for s in self.symbols], ignore_index=True)
 
 
+def month_start(now_ms: int) -> int:
+    return int(pd.Timestamp(now_ms, unit="ms").to_period("M").start_time.value // 1_000_000)
+
+
 class Model:
     """The research model refit monthly: standardize on the training rows, clip, L2 logistic regression.
 
@@ -154,7 +165,7 @@ class Model:
         return add_ranks(add_relative(data, coins), coins)
 
     def refit_if_needed(self, data: pd.DataFrame, now_ms: int) -> None:
-        month = int(pd.Timestamp(now_ms, unit="ms").to_period("M").start_time.value // 1_000_000)
+        month = month_start(now_ms)
         if month == self.month:
             return
         rows = data.dropna(subset=self.features + ["fwd", "sd42"])
@@ -173,6 +184,31 @@ class Model:
         return predict(self.w, self._scale(rows[self.features].to_numpy(float)))
 
 
+class SizeModel(Model):
+    """v14's "how much": a ridge regression on the relative return itself over `horizon` bars, refit monthly on the
+    same rows and features as the relative model, as research/size_model.walk_forward does it."""
+
+    def __init__(self, horizon: int) -> None:
+        super().__init__(horizon, relative=True)
+        self.kind, self.version = "size", 14
+
+    def refit_if_needed(self, data: pd.DataFrame, now_ms: int) -> None:
+        month = month_start(now_ms)
+        if month == self.month:
+            return
+        rows = data.dropna(subset=self.features + ["fwd"])
+        rows = rows[(rows["close_ms"] >= DEV_START_MS) & (rows["close_ms"] + self.horizon * BAR_MS <= month)]
+        x, y = rows[self.features].to_numpy(float), rows["fwd"].to_numpy(float)
+        self.mean, self.std = x.mean(axis=0), x.std(axis=0)
+        self.std[self.std == 0] = 1.0
+        low, high = np.quantile(y, size_model.TRIM)
+        self.w, self.intercept = size_model.fit(self._scale(x), np.clip(y, low, high))
+        self.month, self.train_rows = month, len(rows)
+
+    def predict(self, rows: pd.DataFrame) -> np.ndarray:
+        return self._scale(rows[self.features].to_numpy(float)) @ self.w + self.intercept
+
+
 def predictions_for(rows: pd.DataFrame, p: np.ndarray, close_ms: int, model: Model, made_ms: int) -> list[dict]:
     out = []
     for (_, r), prob in zip(rows.iterrows(), p):
@@ -186,8 +222,8 @@ def predictions_for(rows: pd.DataFrame, p: np.ndarray, close_ms: int, model: Mod
 
 def outcomes_for(predicted: list[dict], scored: set, data: pd.DataFrame) -> list[dict]:
     """The close at the end of the horizon for every prediction not yet scored whose horizon has ended.
-    Rows written before 8-hour predictions existed have no `horizon`: they are 4-hour ones. A relative prediction also
-    gets `relative_return`: the coin's return minus the median coin's (`fwd` of the relative model's rows)."""
+    Rows written before 8-hour predictions existed have no `horizon`: they are 4-hour ones. A relative or size
+    prediction also gets `relative_return`: the coin's return minus the median coin's (`fwd` of that model's rows)."""
     indexed = data.set_index(["symbol", "close_ms"])
     close = indexed["logc"]
     out = []
@@ -199,7 +235,7 @@ def outcomes_for(predicted: list[dict], scored: set, data: pd.DataFrame) -> list
             continue
         row = {"close_ms": p["close_ms"], "horizon": horizon, "kind": kind, "symbol": p["symbol"],
                "next_price": float(math.exp(close[nxt])), "log_return": float(close[nxt] - math.log(p["price"]))}
-        if kind == "relative":
+        if kind != "direction":
             relative = indexed["fwd"].get(key[:2], np.nan)
             if not np.isfinite(relative):
                 continue
@@ -240,6 +276,38 @@ def cycle(market: Market, models: list[Model], directory: Path, now_ms: int, clo
             append(directory / "predictions.jsonl", predictions_for(rows, model.predict(rows), latest, model, made))
             messages.append(f"predicted {len(rows)} coins")
     return next((m for m in messages if m.startswith("predicted")), messages[0])     # the first model predicts every coin
+
+
+def large_coins(market: Market) -> list[str]:
+    """The coins v14 traded: the SIZE_COINS largest of the relative model's coins. Empty when there are too few coins."""
+    bars = {s: b for s, b in market.bars.items() if s not in NOT_RELATIVE}
+    return size_model.largest(bars, VAL_END_MS, SIZE_COINS) if len(bars) > SIZE_COINS else []
+
+
+def size_cycle(market: Market, models: list[SizeModel], large: list[str], directory: Path, now_ms: int, clock=time.time) -> str:
+    """Records every period's predicted size for the large coins at the latest close and scores the periods that have
+    ended. `rank` is the coin's place among the `coins` large coins predicted at that close and period, 1 = the largest
+    size. Run it after cycle(), which tops up the market."""
+    predicted = read_jsonl(directory / "size_predictions.jsonl")
+    scored = {(o["symbol"], o["close_ms"], o["horizon"], "size") for o in read_jsonl(directory / "size_outcomes.jsonl")}
+    latest = now_ms // BAR_MS * BAR_MS
+    done = latest in {p["close_ms"] for p in predicted}
+    new, made = [], int(clock() * 1000)
+    for model in models:
+        data = model.prepare(with_closes(market.frames(model.horizon), market.bars))
+        model.refit_if_needed(data, now_ms)
+        append(directory / "size_outcomes.jsonl", outcomes_for([p for p in predicted if p["horizon"] == model.horizon], scored, data))
+        rows = data[(data["close_ms"] == latest) & data["symbol"].isin(large)].dropna(subset=model.features + ["logc"])
+        if done or rows.empty or made - latest > MAX_LATE_MS:
+            continue
+        rows = rows.assign(size=model.predict(rows)).sort_values(["size", "symbol"], ascending=[False, True])
+        new += [{"close_ms": latest, "horizon": model.horizon, "kind": model.kind, "symbol": r["symbol"], "price": float(math.exp(r["logc"])),
+                 "size": float(r["size"]), "rank": place, "coins": len(rows), "model_month": model.month, "version": model.version,
+                 "made_ms": made} for place, (_, r) in enumerate(rows.iterrows(), start=1)]
+    append(directory / "size_predictions.jsonl", new)
+    if new:
+        return f"sizes for {len({p['symbol'] for p in new})} coins"
+    return "sizes already recorded" if done else "too late for sizes at this close" if made - latest > MAX_LATE_MS else "no sizes for this close yet"
 
 
 def bars_ending_now(candles: np.ndarray) -> np.ndarray:
@@ -329,6 +397,7 @@ def main() -> int:
     client = _keyless_client()
     symbols = collect_symbols()
     market, models = Market(DIR, client, symbols), [Model(h, relative) for relative in (False, True) for h in HORIZONS]
+    size_models = [SizeModel(h) for h in size_model.PERIODS.values()]
     collector = Collector(DIR, client, symbols)
     collector.start_liquidations()
     print("direction predictor started: no orders, public prices only", flush=True)
@@ -351,6 +420,12 @@ def main() -> int:
             collector.positioning(int(time.time() * 1000))
         except Exception as e:
             print(time.strftime("%F %T"), f"collector: {type(e).__name__}: {str(e)[:200]}", flush=True)
+        try:                        # last: it is the slowest and nothing else waits for it
+            large = large_coins(market)
+            if large:
+                print(time.strftime("%F %T"), size_cycle(market, size_models, large, DIR, now), flush=True)
+        except Exception as e:
+            print(time.strftime("%F %T"), f"sizes: {type(e).__name__}: {str(e)[:200]}", flush=True)
         write_status(DIR, ok=True, message=message, model_month=models[0].month, train_rows=models[0].train_rows,
                      collected=collector.counts)
         wake = (now // BAR_MS + 1) * BAR_MS + WAKE_AFTER_CLOSE_MS

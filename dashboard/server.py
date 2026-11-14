@@ -50,6 +50,8 @@ PREDICTOR_STALE_MS = BAR_MS + 20 * 60_000
 ROUND_TRIP_COST = 0.002     # the research cost: 0.10% per side
 MAX_PREDICTION_ROWS = 60
 MAX_LATEST_ROWS = 15
+SIZE_PERIODS = {2: "8시간", 6: "24시간", 18: "3일", 42: "7일"}      # research/size_model.PERIODS, in 4h bars
+SIZE_SHARE = 0.1            # the share of the coins on each end that is scored, as in the research: 3 of 30
 
 
 def mask(text: str) -> str:
@@ -230,6 +232,41 @@ def now_view(folder: Path) -> dict:
             "made_ms": answer.get("made_ms"), "message": mask(str(answer.get("message", "")))[:200], "coins": coins}
 
 
+def size_summary(folder: Path) -> list[dict]:
+    """The live "how much" record (v14) for the large coins. Per period: what the coins with the highest and the lowest
+    predicted sizes at each close were told and what they got, as returns over the median coin's. Only predictions
+    by the newest model in the file count."""
+    predicted = read_ledger(folder / "size_predictions.jsonl")
+    answers = {(o.get("symbol"), o.get("close_ms"), o.get("horizon")): o.get("relative_return")
+               for o in read_ledger(folder / "size_outcomes.jsonl")}
+    newest = max((p.get("version", 0) for p in predicted), default=None)
+    latest = max((p.get("close_ms", 0) for p in predicted), default=None)
+    mean = lambda values: sum(values) / len(values) if values else None
+    out = []
+    for horizon, label in SIZE_PERIODS.items():
+        top, bottom, closes, now_top, now_bottom = [], [], set(), [], []
+        for p in predicted:
+            if p.get("horizon") != horizon or p.get("version", 0) != newest:
+                continue
+            k = max(int(p["coins"] * SIZE_SHARE + 0.5), 1)
+            side = top if p["rank"] <= k else bottom if p["rank"] > p["coins"] - k else None
+            if side is None:
+                continue
+            if p["close_ms"] == latest:
+                (now_top if side is top else now_bottom).append({"symbol": p["symbol"], "size": p["size"], "rank": p["rank"]})
+            answer = answers.get((p["symbol"], p["close_ms"], horizon))
+            if answer is not None:
+                side.append((p["size"], answer))
+                closes.add(p["close_ms"])
+        top_actual, bottom_actual = mean([a for _, a in top]), mean([a for _, a in bottom])
+        out.append({"horizon": horizon, "label": label, "closes": len(closes), "top": len(top),
+                    "top_predicted": mean([s for s, _ in top]), "top_actual": top_actual, "top_above": sum(a > 0 for _, a in top),
+                    "bottom": len(bottom), "bottom_predicted": mean([s for s, _ in bottom]), "bottom_actual": bottom_actual,
+                    "spread": None if top_actual is None or bottom_actual is None else top_actual - bottom_actual,
+                    "now_top": sorted(now_top, key=lambda c: c["rank"]), "now_bottom": sorted(now_bottom, key=lambda c: -c["rank"])})
+    return [{"latest_ms": latest, **row} for row in out] if predicted else []
+
+
 def prediction_summary(root: Path, now_ms: float) -> dict:
     """The live direction predictor's record (predictor/live.py), scored against what happened next."""
     folder = root / "runtime" / "predictor"
@@ -306,6 +343,7 @@ def prediction_summary(root: Path, now_ms: float) -> dict:
         "now": now_view(folder),
         "xrp_price": next((r["price"] for r in latest if r["symbol"] == "XRPUSDT"), None),
         "collected": status.get("collected"), "eight": eight, "relative": relative, "relative_version": newest_relative,
+        "size": size_summary(folder),
         "confident": len(confident), "confident_hits": sum(r["hit"] for r, _ in confident),
         "confident_net": sum(confident_net) / len(confident_net) if confident_net else None,
         "scored": n, "hits": sum(r["hit"] for r, _ in scored), "ups": sum(r["up"] for r, _ in scored),

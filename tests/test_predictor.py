@@ -385,3 +385,97 @@ def test_dashboard_scores_only_the_newest_relative_model(tmp_path):
     q = prediction_summary(tmp_path, now_ms=4 * BAR_MS)
     assert q["relative_version"] == 11
     assert q["relative"]["8h"] == {"scored": 1, "hits": 0, "confident": 1, "confident_hits": 0, "top5": 0, "top5_hits": 0}
+
+
+def add_bars(market, steps):
+    """One more bar per step: every coin's prices times the step's factor, or its own factor when the step is a dict."""
+    for step in steps:
+        for s in market.symbols:
+            last = market.bars[s][-1].copy()
+            last[0] += BAR_MS
+            last[1:5] *= step.get(s, step["all"]) if isinstance(step, dict) else step
+            market.bars[s] = np.vstack([market.bars[s], last])
+
+
+def test_size_model_predicts_what_the_research_walk_forward_predicts(monkeypatch):
+    from research import size_model
+    monkeypatch.setattr(live, "DEV_START_MS", 0)
+    now = int(pd.Timestamp("2024-03-10").value // 1_000_000)
+    month = int(pd.Timestamp("2024-03-01").value // 1_000_000)
+    close = now // BAR_MS * BAR_MS
+    market = FakeMarket(close, n=600)
+    for horizon in (2, 42):
+        model = live.SizeModel(horizon)
+        data = model.prepare(live.with_closes(market.frames(horizon), market.bars))
+        model.refit_if_needed(data, now)
+        usable = data.dropna(subset=model.features + ["fwd"])
+        assert model.month == month and model.train_rows == int((usable["close_ms"] + horizon * BAR_MS <= month).sum()) > 100
+        rows = data[data["close_ms"] == close].dropna(subset=model.features)
+        research = size_model.walk_forward(data, horizon, 0, month, close + 1, model.features)
+        research = research[research["close_ms"] == close].set_index("symbol")["size"]
+        assert len(rows) == len(SYMBOLS) and np.allclose(model.predict(rows), research[rows["symbol"]].to_numpy())
+        assert research.isna().sum() == 0 and research.std() > 0     # the newest close has no answer yet and is still predicted
+
+
+def test_sizes_are_recorded_once_for_the_large_coins_and_scored_when_each_period_ends(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "DEV_START_MS", 0)
+    close = T0 + 400 * BAR_MS
+    market, large = FakeMarket(close), SYMBOLS[:5]
+    models = [live.SizeModel(2), live.SizeModel(6)]
+    cycle = lambda now: live.size_cycle(market, models, large, tmp_path, now, clock=lambda: now / 1000)
+    assert cycle(close + 60_000) == "sizes for 5 coins"
+    rows = live.read_jsonl(tmp_path / "size_predictions.jsonl")
+    assert sorted((r["symbol"], r["horizon"]) for r in rows) == sorted((s, h) for s in large for h in (2, 6))
+    assert {(r["kind"], r["version"], r["coins"], r["close_ms"]) for r in rows} == {("size", 14, 5, close)}
+    for h in (2, 6):                                 # rank 1 is the largest predicted size at that close and period
+        mine = sorted((r for r in rows if r["horizon"] == h), key=lambda r: r["rank"])
+        assert [r["rank"] for r in mine] == [1, 2, 3, 4, 5] and [r["size"] for r in mine] == sorted((r["size"] for r in mine), reverse=True)
+    assert math.isclose(next(r for r in rows if r["symbol"] == "ETHUSDT")["price"], market.bars["ETHUSDT"][-1, 4])
+    assert cycle(close + 120_000) == "sizes already recorded" and len(live.read_jsonl(tmp_path / "size_predictions.jsonl")) == 10
+    assert not (tmp_path / "predictions.jsonl").exists()             # never mixed into the direction record
+
+    add_bars(market, [1.02, {"all": 1.02, "ETHUSDT": 1.05}])         # two more bars: every coin +2% each, ETH +5% on the second
+    assert cycle(close + 2 * BAR_MS + live.MAX_LATE_MS + 1) == "too late for sizes at this close"       # it still scores
+    outcomes = [o for o in live.read_jsonl(tmp_path / "size_outcomes.jsonl")]
+    assert {(o["symbol"], o["horizon"], o["close_ms"]) for o in outcomes} == {(s, 2, close) for s in large}      # 24h is not known yet
+    eth = next(o for o in outcomes if o["symbol"] == "ETHUSDT")
+    assert math.isclose(eth["relative_return"], math.log(1.05) - math.log(1.02))     # against the median of all ten coins
+    assert math.isclose(eth["log_return"], math.log(1.05) + math.log(1.02)) and eth["kind"] == "size"
+    add_bars(market, [1.0] * 4)
+    cycle(close + 6 * BAR_MS + 60_000)
+    outcomes = live.read_jsonl(tmp_path / "size_outcomes.jsonl")
+    assert {(o["symbol"], o["horizon"]) for o in outcomes if o["close_ms"] == close} == {(s, h) for s in large for h in (2, 6)}
+    assert len({(o["symbol"], o["horizon"], o["close_ms"]) for o in outcomes}) == len(outcomes)      # each one is scored once
+
+
+def test_sizes_need_the_full_coin_list():
+    assert live.large_coins(FakeMarket(T0 + 400 * BAR_MS)) == []     # ten coins: not the 59 the model was researched on
+
+
+def test_dashboard_scores_the_highest_and_lowest_sizes_per_period(tmp_path):
+    folder = tmp_path / "runtime/predictor"
+    folder.mkdir(parents=True)
+    base = {"close_ms": 0, "horizon": 42, "kind": "size", "coins": 30, "version": 14, "price": 1.0}
+    write(folder / "size_predictions.jsonl", [
+        {**base, "symbol": "AUSDT", "size": 0.03, "rank": 1},
+        {**base, "symbol": "BUSDT", "size": 0.02, "rank": 3},
+        {**base, "symbol": "CUSDT", "size": 0.019, "rank": 4},           # outside the top three of thirty: not scored
+        {**base, "symbol": "DUSDT", "size": -0.01, "rank": 28},
+        {**base, "symbol": "EUSDT", "size": 0.5, "rank": 1, "version": 13},      # an older model: left out
+        {**base, "symbol": "AUSDT", "size": 0.04, "rank": 2, "close_ms": BAR_MS},        # the newest close: not answered yet
+        {**base, "symbol": "DUSDT", "size": -0.02, "rank": 30, "close_ms": BAR_MS},
+        {**base, "symbol": "AUSDT", "size": 0.004, "rank": 1, "horizon": 2}])
+    answer = {"close_ms": 0, "horizon": 42, "kind": "size", "log_return": 0.0}
+    write(folder / "size_outcomes.jsonl", [
+        {**answer, "symbol": "AUSDT", "relative_return": 0.02}, {**answer, "symbol": "BUSDT", "relative_return": -0.01},
+        {**answer, "symbol": "CUSDT", "relative_return": 0.2}, {**answer, "symbol": "DUSDT", "relative_return": -0.015},
+        {**answer, "symbol": "EUSDT", "relative_return": 0.3}])
+    sizes = {s["label"]: s for s in prediction_summary(tmp_path, now_ms=BAR_MS)["size"]}
+    week = sizes["7일"]
+    assert list(sizes) == ["8시간", "24시간", "3일", "7일"] and week["latest_ms"] == BAR_MS
+    assert (week["closes"], week["top"], week["top_above"], week["bottom"]) == (1, 2, 1, 1)
+    assert math.isclose(week["top_predicted"], 0.025) and math.isclose(week["top_actual"], 0.005)
+    assert math.isclose(week["bottom_actual"], -0.015) and math.isclose(week["spread"], 0.02)
+    assert [c["symbol"] for c in week["now_top"]] == ["AUSDT"] and [c["symbol"] for c in week["now_bottom"]] == ["DUSDT"]
+    assert sizes["8시간"]["closes"] == 0 and sizes["8시간"]["top_actual"] is None and sizes["8시간"]["spread"] is None
+    assert prediction_summary(tmp_path / "nothing", now_ms=BAR_MS)["size"] == []
