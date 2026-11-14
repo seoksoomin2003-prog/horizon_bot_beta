@@ -20,3 +20,8 @@ runtime/paper_settings.json
 # Historical replay data and runs
 replay_data/
 runtime/predictor/
+
+# Local bot state and per-machine settings
+data/
+runtime/binance/
+.claude/settings.local.json

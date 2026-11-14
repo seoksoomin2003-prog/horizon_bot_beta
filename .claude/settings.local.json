@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(grep -r ccxt /Users/soominseok/Desktop/horizon_bot_beta --include=*.txt --include=*.py)"
-    ]
-  }
-}
