@@ -3,7 +3,8 @@ weights and the bot's own signals."""
 import numpy as np
 import pandas as pd
 
-from research.direction import BAR_MS, FEATURES, MARKET_FEATURES, REGIMES, add_regime, add_relative, frame, walk_forward
+from research.direction import (BAR_MS, FEATURES, MARKET_FEATURES, RANK_FEATURES, REGIMES, add_ranks, add_regime, add_relative, frame,
+                                walk_forward)
 from tests.test_direction import T0, bars
 
 CUT = 1100                          # bars from here on are replaced by a different future
@@ -40,6 +41,12 @@ def same_before_and_different_after(a: pd.DataFrame, b: pd.DataFrame) -> None:
 def test_walk_forward_predictions_ignore_everything_after_them():
     """End to end for the v9 model: features, the market median, scaling, the fit and the confidence cutoffs."""
     run = lambda other: predictions(add_relative(market(other), REFERENCE), FEATURES + MARKET_FEATURES)
+    same_before_and_different_after(run(False), run(True))
+
+
+def test_rank_features_ignore_everything_after_them():
+    run = lambda other: predictions(add_ranks(add_relative(market(other), REFERENCE), REFERENCE, at_least=3),
+                                    FEATURES + MARKET_FEATURES + RANK_FEATURES)
     same_before_and_different_after(run(False), run(True))
 
 

@@ -223,3 +223,19 @@ def test_relative_target_is_measured_against_the_reference_coins_only():
     later = data.copy()
     later.loc[later["close_ms"] == 2, "r1"] = 9.0                                 # a later bar never changes an earlier feature
     assert np.allclose(add_relative(later, {"A", "B", "C"}).loc[:3, "xs_r1"], out.loc[:3, "xs_r1"])
+
+
+def test_rank_is_the_share_of_other_reference_coins_below():
+    from research.direction import RANK_FEATURES, add_ranks
+    row = lambda symbol, t, v: {"symbol": symbol, "close_ms": t, **{k: v for k in ("r1", "r6", "r42", "vol", "volume", "funding", "range_pos")}}
+    data = pd.DataFrame([row("A", 0, 1.0), row("B", 0, 2.0), row("C", 0, 3.0), row("D", 0, 2.0), row("OUT", 0, 2.5), row("GAP", 0, np.nan),
+                         row("A", 1, 5.0), row("B", 1, 4.0)])
+    ref = {"A", "B", "C", "D", "GAP"}
+    out = add_ranks(data, ref, at_least=3).set_index(["symbol", "close_ms"])["r1_rank"]
+    assert out["A", 0] == -0.5 and out["C", 0] == 0.5                # lowest and highest of the four with a value
+    assert out["B", 0] == out["D", 0] == (1 + 0.5) / 3 - 0.5         # one below, one tie, of three others
+    assert out["OUT", 0] == 3 / 4 - 0.5                              # placed among the four reference coins
+    assert np.isnan(out["GAP", 0]) and np.isnan(out["A", 1])         # no value; too few reference coins at that close
+    without = add_ranks(data[data["symbol"] != "OUT"], ref, at_least=3).set_index(["symbol", "close_ms"])
+    assert out.drop(("OUT", 0)).equals(without["r1_rank"])           # an outside coin never moves the ranks
+    assert set(RANK_FEATURES) <= set(without.columns)

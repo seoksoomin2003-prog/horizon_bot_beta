@@ -10,8 +10,10 @@ and keeps score. A prediction is only recorded within MAX_LATE_MS of the close, 
 skips it instead of predicting after the fact.
 
 It records a second kind of prediction too, "relative": the probability that the coin does better than the median
-coin over the same 4 or 8 hours. On 46 coins that model never saw, its top 10% hit 57% and 58%, above 55% in every
-year (docs/research/direction_result_v9.md). BTCDOMUSDT, an index product, is left out of it.
+coin over the same 4 or 8 hours. Besides the direction features it sees where each feature ranks among the coins
+(v11). On 46 coins that model never saw, its top 10% hit 57% and 58%, above 55% in every year
+(docs/research/direction_result_v11.md). BTCDOMUSDT, an index product, is left out of it. Every row carries the
+model's `version`, so a score can leave out predictions made by an earlier model.
 
 Each model refits on the first of every month on rows whose answer was known by then, exactly as in the research.
 
@@ -36,7 +38,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from research.direction import ABS_MOVE, CLIP, FEATURES, MARKET_FEATURES, add_relative, fit, frame, predict  # noqa: E402
+from research.direction import (ABS_MOVE, CLIP, FEATURES, MARKET_FEATURES, RANK_FEATURES, add_ranks, add_relative, fit,  # noqa: E402
+                                frame, predict)
 from research.h4_data import BAR_MS, DEV_START_MS, SYMBOLS, V6_DIR, V6_SYMBOLS_FILE, WARMUP_START_MS, _pages  # noqa: E402
 from predictor.collect import Collector  # noqa: E402
 
@@ -130,13 +133,15 @@ class Model:
     It learns from every coin it predicts (v7 H2: learning from more coins predicted unseen coins better) and keeps
     `thr` and `thr95`, the 90th and 95th percentiles of |p - 0.5| on its training rows: the "confident" cutoffs.
 
-    With `relative` it answers "will the coin beat the median coin?" instead (v9), with two more features.
+    With `relative` it answers "will the coin beat the median coin?" instead (v9), with two more features and each
+    feature's rank among the coins (v11). `version` is the research version that fixed the model.
     """
 
     def __init__(self, horizon: int = 1, relative: bool = False) -> None:
         self.horizon, self.relative = horizon, relative
         self.kind = "relative" if relative else "direction"
-        self.features = FEATURES + MARKET_FEATURES if relative else FEATURES
+        self.features = FEATURES + MARKET_FEATURES + RANK_FEATURES if relative else FEATURES
+        self.version = 11 if relative else 7
         self.month: int | None = None
         self.train_rows = 0
 
@@ -145,7 +150,8 @@ class Model:
         if not self.relative:
             return data
         data = data[~data["symbol"].isin(NOT_RELATIVE)]
-        return add_relative(data, set(data["symbol"]))
+        coins = set(data["symbol"])
+        return add_ranks(add_relative(data, coins), coins)
 
     def refit_if_needed(self, data: pd.DataFrame, now_ms: int) -> None:
         month = int(pd.Timestamp(now_ms, unit="ms").to_period("M").start_time.value // 1_000_000)
@@ -174,7 +180,7 @@ def predictions_for(rows: pd.DataFrame, p: np.ndarray, close_ms: int, model: Mod
         out.append({"close_ms": close_ms, "horizon": model.horizon, "kind": model.kind, "symbol": r["symbol"], "price": float(math.exp(r["logc"])),
                     "p_up": float(prob), "expected_gain": float(gain), "signal": bool(gain > SIGNAL_GAIN),
                     "confident": bool(abs(prob - 0.5) >= model.thr), "top5": bool(abs(prob - 0.5) >= model.thr95),
-                    "model_month": model.month, "made_ms": made_ms})
+                    "model_month": model.month, "version": model.version, "made_ms": made_ms})
     return out
 
 

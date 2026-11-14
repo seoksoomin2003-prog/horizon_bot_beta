@@ -246,6 +246,8 @@ def prediction_summary(root: Path, now_ms: float) -> dict:
     tally = lambda: {"scored": 0, "hits": 0, "confident": 0, "confident_hits": 0, "top5": 0, "top5_hits": 0}
     eight, relative = tally(), {"4h": tally(), "8h": tally()}      # 8-hour predictions; "beats the median coin" predictions
     eight_p, relative_p, eight_flags = {}, {}, {}
+    # The relative model changed with v11; only predictions by the newest model in the file are scored.
+    newest_relative = max((p.get("version", 9) for p in predicted if p.get("kind") == "relative"), default=None)
     for p in predicted:
         horizon, kind = p.get("horizon", 1), p.get("kind", "direction")     # older rows are 4-hour direction ones
         o = outcomes.get((p.get("symbol"), p.get("close_ms"), horizon, kind))
@@ -258,6 +260,8 @@ def prediction_summary(root: Path, now_ms: float) -> dict:
                 if kind == "direction":
                     eight_flags[(p.get("symbol"), p.get("close_ms"))] = (bool(p.get("confident")), bool(p.get("top5")))
             answer = None if o is None else o.get("relative_return" if kind == "relative" else "log_return")
+            if kind == "relative" and p.get("version", 9) != newest_relative:
+                answer = None
             if answer is not None:
                 hit = (p["p_up"] > 0.5) == (answer > 0)
                 for key, counted in (("scored", True), ("confident", p.get("confident")), ("top5", p.get("top5"))):
@@ -301,7 +305,7 @@ def prediction_summary(root: Path, now_ms: float) -> dict:
         "coins": sorted(coins, key=lambda c: c["symbol"]),
         "now": now_view(folder),
         "xrp_price": next((r["price"] for r in latest if r["symbol"] == "XRPUSDT"), None),
-        "collected": status.get("collected"), "eight": eight, "relative": relative,
+        "collected": status.get("collected"), "eight": eight, "relative": relative, "relative_version": newest_relative,
         "confident": len(confident), "confident_hits": sum(r["hit"] for r, _ in confident),
         "confident_net": sum(confident_net) / len(confident_net) if confident_net else None,
         "scored": n, "hits": sum(r["hit"] for r, _ in scored), "ups": sum(r["up"] for r, _ in scored),

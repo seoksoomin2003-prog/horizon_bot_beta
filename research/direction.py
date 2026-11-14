@@ -1,7 +1,7 @@
 """Direction model for docs/research/direction_preregistration_v3.md (v4: fixed bet threshold, v5: order-flow and basis
 features, v6: external features and transfer, v7: limit-order fills, positioning and market-relative features,
 v8: stricter fills and per-decision-time baskets, v9: direction relative to the median coin, v10: weights that
-change with the market's state).
+change with the market's state, v11: each feature's rank among the coins).
 Parameters are fixed in those documents; do not tune."""
 
 from __future__ import annotations
@@ -31,6 +31,8 @@ M5_MS = 300_000
 MAKER_COST = 0.0002         # v7: the exchange's base limit-order fee per side
 FILL_BARS = 6               # v7: a limit order waits 30 minutes
 BASKET_CAP = 10             # v8: a trade gets at most a tenth of the capital
+RANKED = ["r1", "r6", "r42", "vol", "volume", "funding", "range_pos"]       # v11
+RANK_FEATURES = [f"{k}_rank" for k in RANKED]
 REGIMES = ["up_calm", "up_wild", "down_calm", "down_wild"]      # v10
 REGIME_WINDOW = 360         # v10: "usual" volatility is the median of the last 360 closes (60 days)
 
@@ -154,6 +156,30 @@ def add_relative(data: pd.DataFrame, reference: set[str]) -> pd.DataFrame:
     out["xs_r1"], out["xs_r6"] = out["r1"] - median("r1"), out["r6"] - median("r6")
     out["fwd_abs"] = out["fwd"]
     out["fwd"] = out["fwd"] - median("fwd")
+    return out
+
+
+def add_ranks(data: pd.DataFrame, reference: set[str], at_least: int = 10) -> pd.DataFrame:
+    """v11: adds RANK_FEATURES, where each RANKED feature stands among the reference coins at the same close.
+
+    A rank is the share of the *other* reference coins with a lower value (ties count half), minus 0.5: -0.5 is the
+    lowest, +0.5 the highest. A coin outside `reference` is placed among the reference coins and never moves their
+    ranks. Closes with fewer than `at_least` reference values get no rank.
+    """
+    out = data.copy()
+    groups = list(out.groupby("close_ms").indices.values())
+    inside = out["symbol"].isin(reference).to_numpy()
+    for k in RANKED:
+        values, ranks = out[k].to_numpy(float), np.full(len(out), np.nan)
+        for idx in groups:
+            v = values[idx]
+            own = inside[idx] & np.isfinite(v)          # coins whose own value sits among the reference values
+            ref = np.sort(v[own])
+            if len(ref) < at_least:
+                continue
+            lower, upper = np.searchsorted(ref, v, "left"), np.searchsorted(ref, v, "right")
+            ranks[idx] = np.where(np.isfinite(v), (lower + 0.5 * (upper - lower - own)) / (len(ref) - own) - 0.5, np.nan)
+        out[f"{k}_rank"] = ranks
     return out
 
 

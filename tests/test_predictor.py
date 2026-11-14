@@ -359,3 +359,29 @@ def test_dashboard_asks_for_an_as_of_now_prediction_only_while_the_predictor_run
     (folder / "now.json").write_text(json.dumps({"requested_ms": asked, "ok": True, "made_ms": asked + 5, "coins": [{"symbol": "BTCUSDT", "p_up": 0.6}]}))
     view = now_view(folder)
     assert not view["pending"] and view["ok"] and view["coins"][0]["symbol"] == "BTCUSDT"
+
+
+def test_relative_model_ranks_the_coins_and_stamps_its_version(tmp_path):
+    from research.direction import RANK_FEATURES
+    market = FakeMarket(T0)
+    relative, direction = live.Model(2, relative=True), live.Model(2)
+    assert set(RANK_FEATURES) <= set(relative.features) and not set(RANK_FEATURES) & set(direction.features)
+    data = relative.prepare(market.frames(2))
+    last = data[data["close_ms"] == T0]
+    assert np.allclose(sorted(last["r1_rank"]), np.linspace(-0.5, 0.5, len(SYMBOLS)))     # one coin at every step from lowest to highest
+    live.cycle(market, [relative, direction], tmp_path, T0 + 60_000, clock=lambda: (T0 + 60_000) / 1000)
+    rows = live.read_jsonl(tmp_path / "predictions.jsonl")
+    assert {(r["kind"], r["version"]) for r in rows} == {("relative", 11), ("direction", 7)}
+
+
+def test_dashboard_scores_only_the_newest_relative_model(tmp_path):
+    folder = tmp_path / "runtime/predictor"
+    folder.mkdir(parents=True)
+    row = lambda t, symbol, **more: {"close_ms": t, "horizon": 2, "kind": "relative", "symbol": symbol, "price": 1.0, "p_up": 0.6, **more}
+    write(folder / "predictions.jsonl", [row(0, "BTCUSDT"), row(0, "ETHUSDT", version=9), row(BAR_MS, "BTCUSDT", version=11, confident=True)])
+    write(folder / "outcomes.jsonl", [{**row(0, "BTCUSDT"), "log_return": 0.0, "relative_return": 0.01},
+                                      {**row(0, "ETHUSDT"), "log_return": 0.0, "relative_return": 0.01},
+                                      {**row(BAR_MS, "BTCUSDT"), "log_return": 0.0, "relative_return": -0.01}])
+    q = prediction_summary(tmp_path, now_ms=4 * BAR_MS)
+    assert q["relative_version"] == 11
+    assert q["relative"]["8h"] == {"scored": 1, "hits": 0, "confident": 1, "confident_hits": 0, "top5": 0, "top5_hits": 0}
