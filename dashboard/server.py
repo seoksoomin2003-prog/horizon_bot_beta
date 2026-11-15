@@ -267,6 +267,40 @@ def size_summary(folder: Path) -> list[dict]:
     return [{"latest_ms": latest, **row} for row in out] if predicted else []
 
 
+def shadow_summary(folder: Path) -> dict:
+    """v15's shadow book (predictor/shadow.py): virtual money, no orders. Its path, costs, positions and the alphas'
+    rank IC once their 7 days have passed."""
+    book, ics = read_ledger(folder / "shadow_book.jsonl"), read_ledger(folder / "shadow_ic.jsonl")
+    try:
+        state = json.loads((folder / "shadow_state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+    if not book:
+        return {"rows": 0}
+    equity = [1000.0] + [r["equity"] for r in book]
+    peak, drawdown = equity[0], 0.0
+    for e in equity:
+        peak = max(peak, e)
+        drawdown = max(drawdown, 1 - e / peak)
+    days = (book[-1]["close_ms"] - book[0]["close_ms"]) / 86_400_000
+    # the first rebalance builds the book from nothing; turnover counts the trading after it, once a day has passed
+    turnover = sum(r["traded"] for r in book[1:]) / days if days >= 1 else None
+    values = [r["ic"] for r in ics]
+    spaced = values[::42]                       # closes 7 days apart: their horizons do not overlap
+    sd = (sum((v - sum(spaced) / len(spaced)) ** 2 for v in spaced) / (len(spaced) - 1)) ** 0.5 if len(spaced) > 2 else 0.0
+    weights = sorted((state.get("weights") or {}).items(), key=lambda kv: -kv[1])
+    return {"rows": len(book), "first_ms": book[0]["close_ms"], "last_ms": book[-1]["close_ms"], "equity": book[-1]["equity"],
+            "total": book[-1]["equity"] / 1000.0 - 1, "max_drawdown": drawdown,
+            "cost": sum(r["cost"] for r in book), "funding": sum(r["funding"] for r in book),
+            "turnover_per_day": turnover, "gross": book[-1]["gross"], "net": book[-1]["net"],
+            "beta": book[-1]["beta"], "positions": book[-1]["positions"], "rebalanced": sum(bool(r["rebalanced"]) for r in book),
+            "note": mask(str(book[-1].get("note", "")))[:120],
+            "longs": [{"symbol": s, "weight": w} for s, w in weights if w > 0],
+            "shorts": [{"symbol": s, "weight": w} for s, w in weights[::-1] if w < 0],
+            "ic_count": len(values), "ic_mean": sum(values) / len(values) if values else None,
+            "ic_t": (sum(spaced) / len(spaced)) / (sd / len(spaced) ** 0.5) if sd > 0 else None, "ic_spaced": len(spaced)}
+
+
 def prediction_summary(root: Path, now_ms: float) -> dict:
     """The live direction predictor's record (predictor/live.py), scored against what happened next."""
     folder = root / "runtime" / "predictor"
@@ -344,6 +378,7 @@ def prediction_summary(root: Path, now_ms: float) -> dict:
         "xrp_price": next((r["price"] for r in latest if r["symbol"] == "XRPUSDT"), None),
         "collected": status.get("collected"), "eight": eight, "relative": relative, "relative_version": newest_relative,
         "size": size_summary(folder),
+        "shadow": shadow_summary(folder),
         "confident": len(confident), "confident_hits": sum(r["hit"] for r, _ in confident),
         "confident_net": sum(confident_net) / len(confident_net) if confident_net else None,
         "scored": n, "hits": sum(r["hit"] for r, _ in scored), "ups": sum(r["up"] for r, _ in scored),

@@ -114,6 +114,17 @@ button:disabled { opacity: .5; cursor: default; }
       <div><dt>시장 대비 4시간 확신 상위 10%</dt><dd id="predrel4conf">-</dd></div>
     </dl>
     <p class="label" id="prednote"></p>
+    <h2 class="spaced">그림자 장부 (v15) <span class="label">가상 1,000 · 주문 없음 · 큰 코인 30개 시장 중립 · 4시간마다 비용과 자금조달비를 빼고 기록</span></h2>
+    <dl class="kpis spaced">
+      <div><dt>수익률 (비용 차감)</dt><dd id="shtotal">-</dd></div>
+      <div><dt>최대 낙폭</dt><dd id="shdd">-</dd></div>
+      <div><dt>하루 회전율</dt><dd id="shturn">-</dd></div>
+      <div><dt>누적 비용 / 자금조달비</dt><dd id="shcost">-</dd></div>
+      <div><dt>보유 코인 (총액 / 순노출)</dt><dd id="shpos">-</dd></div>
+      <div><dt>예측 IC (7일 뒤 채점)</dt><dd id="shic">-</dd></div>
+    </dl>
+    <p class="label" id="shlongs"></p>
+    <p class="label" id="shnote"></p>
     <h2 class="spaced">얼마나 오를까 <span class="label">큰 코인 30개 · 중간 코인보다 몇 % 더 오를지를 기간마다 기록하고 기간이 끝나면 채점</span></h2>
     <div class="scroll"><table>
       <thead><tr><th>기간</th><th class="num">채점된 시각</th><th class="num">가장 크게 본 3개: 예측</th><th class="num">실제</th><th class="num">중간보다 오른 비율</th><th class="num">가장 작게 본 3개: 실제</th><th class="num">둘의 차이</th><th>지금 가장 크게 본 코인</th><th>지금 가장 작게 본 코인</th></tr></thead>
@@ -440,6 +451,18 @@ function renderPredictions(q) {
     [picks(s.now_top)], [picks(s.now_bottom)]])), "아직 기록이 없습니다. 예측 기록을 켜면 다음 4시간봉 마감 때부터 쌓입니다.", 9);
   $("sizenote").textContent = (sizes.length && sizes[0].latest_ms ? `지금 본 코인은 ${when(sizes[0].latest_ms)} 마감 기준입니다. ` : "")
     + "값은 그 코인의 수익률에서 59개 코인의 중간 수익률을 뺀 것입니다. 연구(v14)에서는 가장 크게 본 10%가 7일 동안 예측 +2.2%에 실제 +1.7%였고, 가장 작게 본 10%와의 차이는 0.8%p였습니다. 이 예측으로 거래하는 방법은 수익 시험을 통과하지 못했습니다. 채점은 기간이 끝나야 나오므로 7일 예측은 일주일 뒤부터 쌓입니다. 긴 기간은 이웃한 시각끼리 기간이 겹쳐서, 채점 횟수가 보이는 것보다 훨씬 적은 표본입니다.";
+  const sh = q.shadow || { rows: 0 };
+  const sgn = (v, d = 2) => v == null ? "없음" : (v > 0 ? "+" : "") + pct(v, d);
+  $("shtotal").textContent = sh.rows ? sgn(sh.total) : "기록 없음";
+  $("shdd").textContent = sh.rows ? pct(sh.max_drawdown, 1) : "-";
+  $("shturn").textContent = sh.turnover_per_day == null ? "하루 뒤부터" : `${sh.turnover_per_day.toFixed(2)}배`;
+  $("shcost").textContent = sh.rows ? `${sgn(sh.cost)} / ${sgn(sh.funding)}` : "-";
+  $("shpos").textContent = sh.rows ? `${sh.positions}개 (${sh.gross.toFixed(2)} / ${sgn(sh.net, 0)})` : "-";
+  $("shic").textContent = sh.ic_count ? `${sgn(sh.ic_mean, 1)} (${sh.ic_count}회${sh.ic_t == null ? "" : `, t ${sh.ic_t.toFixed(1)}`})` : "7일 뒤부터";
+  const legs = (list) => list.map((c) => `${sym(c.symbol).replace(/USDT$/, "")} ${pct(Math.abs(c.weight), 0)}`).join(", ") || "없음";
+  $("shlongs").textContent = sh.rows ? `롱: ${legs(sh.longs)} · 숏: ${legs(sh.shorts)}` : "";
+  $("shnote").textContent = (sh.rows ? `${when(sh.first_ms)}부터 ${sh.rows}회 기록, 마지막 ${when(sh.last_ms)}${sh.note ? ` (${sh.note === "late" ? "마감을 놓쳐 거래 없이 평가만 함" : sh.note})` : ""}. ` : "")
+    + "퀀트 구조(신호: 자금조달비, 낮은 변동성, 낮은 베타 → 기대수익 → 비용을 넣은 최적화)를 실시간으로 돌려 보는 기록입니다. 과거 데이터는 모두 이미 본 것이라 이 기록이 유일하게 깨끗한 증거이고, 판정은 2027-05-15(6개월)에 합니다. 과거 탐색에서는 연 변동성 13%, 비용 1배 +41%(4년 7개월)였지만 2026년과 최근 9개월은 손실이었습니다.";
   renderCoin(q.coins || []);
   if (q.now) nowView = q.now;
   showNow();
