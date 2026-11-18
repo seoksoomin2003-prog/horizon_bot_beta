@@ -269,48 +269,143 @@ def parse_metrics(text: str) -> list[list[float]]:
     return rows
 
 
+FLOW_ARCHIVE_DIR = DATA_DIR / "flow_archive"   # 4h klines and premium index from the archive, every reference coin
+DEPTH_DIR = DATA_DIR / "depth"                 # [close_ms, snapshots, notional within -5..-1 % and +1..+5 % of the mid], before a 4h close
+DEPTH_START_MS = utc_ms("2023-01-01")         # the archive's order-book depth starts here
+DEPTH_LEVELS = [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5]
+
+
+def _monthly_then_daily(path, start_ms: int, end_ms: int) -> list[str]:
+    """path(period, stamp) for every whole month before the last one, then the days of the last (partial) month."""
+    days = _days(start_ms, end_ms)
+    last_month = days[-1][:7]
+    months = sorted({d[:7] for d in days} - {last_month})
+    return [path("monthly", m) for m in months] + [path("daily", d) for d in days if d[:7] == last_month]
+
+
+def flow_files(symbol: str, end_ms: int = VAL_END_MS) -> dict[str, list[str]]:
+    _flow_guard(end_ms)
+    klines = lambda kind: (lambda period, stamp: f"{ARCHIVE}/{period}/{kind}/{symbol}/4h/{symbol}-4h-{stamp}.zip")
+    return {"klines4h": _monthly_then_daily(klines("klines"), WARMUP_START_MS, end_ms),
+            "premium4h": _monthly_then_daily(klines("premiumIndexKlines"), WARMUP_START_MS, end_ms)}
+
+
+def depth_files(symbol: str, end_ms: int = VAL_END_MS) -> list[str]:
+    _flow_guard(end_ms)
+    return [f"{ARCHIVE}/daily/bookDepth/{symbol}/{symbol}-bookDepth-{d}.zip" for d in _days(DEPTH_START_MS, end_ms)]
+
+
+def _ms(field: str) -> int:
+    t = int(field)
+    return t // 1000 if t > 10**14 else t      # some archive files are in microseconds
+
+
+def parse_klines(text: str) -> list[list[float]]:
+    """[open_ms, open, high, low, close, volume, quote_volume, trades, taker_buy_volume, taker_buy_quote]."""
+    rows = []
+    for line in text.splitlines():
+        f = line.split(",")
+        if f[0].isdigit():
+            rows.append([_ms(f[0])] + [float(f[k]) for k in (1, 2, 3, 4, 5, 7, 8, 9, 10)])
+    return rows
+
+
+def parse_premium(text: str) -> list[list[float]]:
+    """[open_ms, premium index close]."""
+    return [[_ms(f[0]), float(f[4])] for f in (line.split(",") for line in text.splitlines()) if f[0].isdigit()]
+
+
+def parse_depth(text: str) -> list[list[float]]:
+    """One row per 4h close in the file's day: the mean notional per level over the snapshots stamped in the 15 minutes
+    before the close, [close_ms, snapshots, notional at DEPTH_LEVELS]. Only those minutes are parsed (the files are large)."""
+    rows = []
+    day = text[text.find("\n") + 1:][:10]
+    if len(day) < 10 or not day[:4].isdigit():
+        return rows
+    base = calendar.timegm(time.strptime(day, "%Y-%m-%d")) * 1000
+    for hour in (3, 7, 11, 15, 19, 23):
+        starts = [i for i in (text.find(f"{day} {hour:02d}:{m}:") for m in range(45, 60)) if i >= 0]
+        if not starts:
+            continue
+        sums, stamps = np.zeros(len(DEPTH_LEVELS)), set()
+        counts = np.zeros(len(DEPTH_LEVELS))
+        for line in text[min(starts):].splitlines():
+            f = line.split(",")
+            if len(f) < 4 or f[0][11:13] != f"{hour:02d}":
+                break
+            level = int(float(f[1]))
+            if level in DEPTH_LEVELS:
+                k = DEPTH_LEVELS.index(level)
+                sums[k] += float(f[3])
+                counts[k] += 1
+                stamps.add(f[0])
+        with np.errstate(invalid="ignore"):
+            mean = np.where(counts > 0, sums / np.maximum(counts, 1), np.nan)
+        rows.append([base + (hour + 1) * 3_600_000, float(len(stamps))] + list(mean))
+    return rows
+
+
+ARCHIVE_KINDS = {     # kind: (folder, file name, row width, parser, the coin's archive URLs)
+    "m5": (M5_DIR, "{s}.npy", 5, parse_m5, lambda s, end: archive_files(s, end_ms=end)["m5"]),
+    "metrics": (METRICS_DIR, "{s}.npy", 4, parse_metrics, lambda s, end: archive_files(s, end_ms=end)["metrics"]),
+    "klines4h": (FLOW_ARCHIVE_DIR, "{s}.klines.npy", 10, parse_klines, lambda s, end: flow_files(s, end)["klines4h"]),
+    "premium4h": (FLOW_ARCHIVE_DIR, "{s}.premium.npy", 2, parse_premium, lambda s, end: flow_files(s, end)["premium4h"]),
+    "depth": (DEPTH_DIR, "{s}.npy", 2 + len(DEPTH_LEVELS), parse_depth, lambda s, end: depth_files(s, end)),
+}
+
+
 def download_archive(symbols: list[str], kinds: tuple[str, ...] = ("m5", "metrics"), end_ms: int = VAL_END_MS, parallel: int = 24) -> None:
-    """Fetches the archive files of each coin and saves the kept rows. A missing file (coin not listed yet) is skipped."""
+    """Fetches the archive files of each coin and saves the kept rows. A missing file (404: not listed yet, or a day the
+    archive lacks) is skipped. A coin with a file that keeps failing is not saved; the others go on, and the run raises at
+    the end. A coin already saved is skipped, so running again resumes."""
     import asyncio
     import io
     import zipfile
 
     import aiohttp
     _flow_guard(end_ms)
-    parsers, folders = {"m5": parse_m5, "metrics": parse_metrics}, {"m5": M5_DIR, "metrics": METRICS_DIR}
 
     async def fetch(session, gate, url: str, parse) -> list:
         async with gate:
-            for attempt in range(4):
+            for attempt in range(8):
                 try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as r:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=180)) as r:
                         if r.status == 404:
                             return []
                         r.raise_for_status()
-                        with zipfile.ZipFile(io.BytesIO(await r.read())) as z:
-                            return parse(z.read(z.namelist()[0]).decode())
-                except (aiohttp.ClientError, asyncio.TimeoutError, zipfile.BadZipFile):
-                    await asyncio.sleep(2 * (attempt + 1))
-            raise RuntimeError(f"could not fetch {url}")
+                        body = await r.read()
+                    with zipfile.ZipFile(io.BytesIO(body)) as z:
+                        return parse(z.read(z.namelist()[0]).decode())
+                except (aiohttp.ClientError, asyncio.TimeoutError, zipfile.BadZipFile, OSError):
+                    await asyncio.sleep(min(5 * 2 ** attempt, 120))
+            return None                                   # still failing: the coin is not saved and is fetched again next run
 
     async def run() -> None:
         gate = asyncio.Semaphore(parallel)
         async with aiohttp.ClientSession() as session:
             for symbol in symbols:
-                files = archive_files(symbol, end_ms=end_ms)
                 for kind in kinds:
-                    path = folders[kind] / f"{symbol}.npy"
+                    folder, name, width, parse, urls = ARCHIVE_KINDS[kind]
+                    path = folder / name.format(s=symbol)
                     if path.exists():
                         continue
-                    pages = await asyncio.gather(*(fetch(session, gate, u, parsers[kind]) for u in files[kind]))
-                    rows = np.array([r for page in pages for r in page], dtype=float).reshape(-1, 5 if kind == "m5" else 4)
+                    files = urls(symbol, end_ms)
+                    pages = await asyncio.gather(*(fetch(session, gate, u, parse) for u in files))
+                    if any(p is None for p in pages):
+                        failed.append(f"{symbol} {kind}")
+                        print(time.strftime("%T"), f"{symbol} {kind}: {sum(p is None for p in pages)} files failed, not saved", flush=True)
+                        continue
+                    rows = np.array([r for page in pages for r in page], dtype=float).reshape(-1, width)
                     rows = rows[np.unique(rows[:, 0], return_index=True)[1]]
                     np.save(path, rows[rows[:, 0] < end_ms])
-                    print(f"{symbol} {kind}: {len(rows)} rows from {sum(bool(p) for p in pages)} of {len(pages)} files", flush=True)
+                    print(time.strftime("%T"), f"{symbol} {kind}: {len(rows)} rows from {sum(bool(p) for p in pages)} of {len(pages)} files", flush=True)
 
-    for folder in folders.values():
-        folder.mkdir(parents=True, exist_ok=True)
+    failed: list[str] = []
+    for kind in kinds:
+        ARCHIVE_KINDS[kind][0].mkdir(parents=True, exist_ok=True)
     asyncio.run(run())
+    if failed:
+        raise RuntimeError(f"not saved, run again to resume: {', '.join(failed)}")
 
 
 def load_m5(symbol: str) -> np.ndarray:
@@ -320,6 +415,21 @@ def load_m5(symbol: str) -> np.ndarray:
 
 def load_metrics(symbol: str) -> np.ndarray:
     rows = np.load(METRICS_DIR / f"{symbol}.npy")
+    return rows[rows[:, 0] < VAL_END_MS]
+
+
+def load_flow_archive(symbol: str) -> np.ndarray:
+    """[open_ms, open, high, low, close, volume, quote_volume, trades, taker_buy_volume, taker_buy_quote, premium_close]."""
+    klines = np.load(FLOW_ARCHIVE_DIR / f"{symbol}.klines.npy")
+    premium = np.load(FLOW_ARCHIVE_DIR / f"{symbol}.premium.npy")
+    i = np.searchsorted(premium[:, 0], klines[:, 0])
+    hit = (i < len(premium)) & (premium[np.minimum(i, len(premium) - 1), 0] == klines[:, 0])
+    rows = np.column_stack([klines, np.where(hit, premium[np.minimum(i, len(premium) - 1), 1], np.nan)])
+    return rows[rows[:, 0] < VAL_END_MS]
+
+
+def load_depth(symbol: str) -> np.ndarray:
+    rows = np.load(DEPTH_DIR / f"{symbol}.npy")
     return rows[rows[:, 0] < VAL_END_MS]
 
 

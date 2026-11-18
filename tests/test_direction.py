@@ -239,3 +239,31 @@ def test_rank_is_the_share_of_other_reference_coins_below():
     without = add_ranks(data[data["symbol"] != "OUT"], ref, at_least=3).set_index(["symbol", "close_ms"])
     assert out.drop(("OUT", 0)).equals(without["r1_rank"])           # an outside coin never moves the ranks
     assert set(RANK_FEATURES) <= set(without.columns)
+
+
+def test_flow_and_depth_archives_stop_before_the_final_check_period():
+    import pytest
+    from research import h4_data
+    flow = h4_data.flow_files("NEARUSDT")
+    assert flow["klines4h"][0].endswith("/monthly/klines/NEARUSDT/4h/NEARUSDT-4h-2020-09.zip")
+    assert flow["klines4h"][-1].endswith("/daily/klines/NEARUSDT/4h/NEARUSDT-4h-2026-08-05.zip")
+    assert flow["premium4h"][-6].endswith("/monthly/premiumIndexKlines/NEARUSDT/4h/NEARUSDT-4h-2026-07.zip")
+    depth = h4_data.depth_files("NEARUSDT")
+    assert depth[0].endswith("NEARUSDT-bookDepth-2023-01-01.zip") and depth[-1].endswith("NEARUSDT-bookDepth-2026-08-05.zip")
+    for fn in (h4_data.flow_files, h4_data.depth_files):
+        with pytest.raises(PermissionError):
+            fn("NEARUSDT", end_ms=h4_data.VAL_END_MS + 1)
+
+
+def test_archive_parsers_for_klines_premium_and_depth():
+    from research import h4_data
+    k = "open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore\n" \
+        "1704067200000,1,2,0.5,1.5,10,1704081599999,15,7,4,6,0\n1704081600000000,2,3,1,2.5,20,0,50,9,12,30,0\n"
+    assert h4_data.parse_klines(k) == [[1704067200000, 1, 2, 0.5, 1.5, 10, 15, 7, 4, 6], [1704081600000, 2, 3, 1, 2.5, 20, 50, 9, 12, 30]]
+    assert h4_data.parse_premium("open_time,open,high,low,close\n1704067200000,0,0,0,0.0003,9\n") == [[1704067200000, 0.0003]]
+    lines = ["timestamp,percentage,depth,notional"]
+    for stamp, scale in (("2024-01-01 03:44:50", 99), ("2024-01-01 03:45:20", 1), ("2024-01-01 03:59:50", 3), ("2024-01-01 04:00:10", 99)):
+        lines += [f"{stamp},{p},1,{scale * abs(p)}" for p in h4_data.DEPTH_LEVELS]
+    rows = h4_data.parse_depth("\n".join(lines) + "\n")
+    assert len(rows) == 1 and rows[0][0] == 1704067200000 + 4 * 3_600_000 and rows[0][1] == 2      # the 04:00 close, two snapshots
+    assert rows[0][2:] == [2.0 * abs(p) for p in h4_data.DEPTH_LEVELS]                            # the mean of 1x and 3x, nothing else
