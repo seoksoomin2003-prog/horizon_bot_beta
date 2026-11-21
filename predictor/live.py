@@ -23,6 +23,9 @@ average, but no way of trading it passed the profit test (docs/research/directio
 A fourth record is v15's shadow book (predictor/shadow.py): the quant architecture's market-neutral book on the 30
 largest coins, marked and rebalanced at every close with costs and funding but without orders, as a forward test.
 
+A fifth is v18's top-coin book (predictor/topcoin.py): the same score's first coin alone, long or flat, sized by its
+volatility, sold when its score turns negative, with every coin's score and status recorded for the dashboard.
+
 Each model refits on the first of every month on rows whose answer was known by then, exactly as in the research.
 
 On request from the dashboard it also predicts "as of now" (predict_now): the same direction models on 4-hour bars
@@ -52,6 +55,7 @@ from research.h4_data import BAR_MS, DEV_START_MS, SYMBOLS, V6_DIR, V6_SYMBOLS_F
 from research import size_model  # noqa: E402
 from predictor.collect import Collector  # noqa: E402
 from predictor.shadow import ShadowBook  # noqa: E402
+from predictor.topcoin import TopCoinBook  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 DIR = ROOT / "runtime" / "predictor"
@@ -403,6 +407,7 @@ def main() -> int:
     market, models = Market(DIR, client, symbols), [Model(h, relative) for relative in (False, True) for h in HORIZONS]
     size_models = [SizeModel(h) for h in size_model.PERIODS.values()]
     shadow = ShadowBook(DIR)
+    top_book = TopCoinBook(DIR)
     collector = Collector(DIR, client, symbols)
     collector.start_liquidations()
     print("direction predictor started: no orders, public prices only", flush=True)
@@ -435,6 +440,10 @@ def main() -> int:
             print(time.strftime("%F %T"), shadow.cycle(market, now), flush=True)
         except Exception as e:
             print(time.strftime("%F %T"), f"shadow: {type(e).__name__}: {str(e)[:200]}", flush=True)
+        try:                        # v18: the top coin alone, long or flat, no orders
+            print(time.strftime("%F %T"), top_book.cycle(market, now), flush=True)
+        except Exception as e:
+            print(time.strftime("%F %T"), f"top-coin book: {type(e).__name__}: {str(e)[:200]}", flush=True)
         write_status(DIR, ok=True, message=message, model_month=models[0].month, train_rows=models[0].train_rows,
                      collected=collector.counts)
         wake = (now // BAR_MS + 1) * BAR_MS + WAKE_AFTER_CLOSE_MS

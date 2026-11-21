@@ -301,6 +301,48 @@ def shadow_summary(folder: Path) -> dict:
             "ic_t": (sum(spaced) / len(spaced)) / (sd / len(spaced) ** 0.5) if sd > 0 else None, "ic_spaced": len(spaced)}
 
 
+def topcoin_summary(folder: Path) -> dict:
+    """v18's top-coin book (predictor/topcoin.py): virtual money, no orders. Its path against the same exposure in the
+    universe and against BTC, the coin held, the latest trades and every coin's score and status at the latest close."""
+    book = read_ledger(folder / "topcoin_book.jsonl")
+    if not book:
+        return {"rows": 0}
+    try:
+        state = json.loads((folder / "topcoin_state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+    trades = read_ledger(folder / "topcoin_trades.jsonl")
+    latest_scores = []
+    for line in tail_lines(folder / "topcoin_scores.jsonl"):
+        try:
+            latest_scores.append(json.loads(line))
+        except ValueError:          # the first line may be cut, the last still being written
+            continue
+    newest = max((r["close_ms"] for r in latest_scores), default=None)
+    latest_scores = sorted((r for r in latest_scores if r["close_ms"] == newest), key=lambda r: r["rank"])
+    equity = [1000.0] + [r["equity"] for r in book]
+    peak, drawdown = equity[0], 0.0
+    for e in equity:
+        peak = max(peak, e)
+        drawdown = max(drawdown, 1 - e / peak)
+    bench = 1.0
+    for r in book:
+        bench *= 1 + (r.get("bench_ret") or 0.0)
+    btc = [r["btc"] for r in book if r.get("btc")]
+    pos = state.get("position")
+    sells = [t for t in trades if t["action"] == "sell"]
+    return {"rows": len(book), "first_ms": book[0]["close_ms"], "last_ms": book[-1]["close_ms"], "equity": book[-1]["equity"],
+            "total": book[-1]["equity"] / 1000.0 - 1, "max_drawdown": drawdown, "benchmark": bench - 1,
+            "btc": btc[-1] / btc[0] - 1 if len(btc) > 1 else None, "funding": sum(r.get("funding", 0.0) for r in book),
+            "position": None if not pos else {"symbol": pos["symbol"], "entry": pos["entry"], "entry_ms": pos["entry_ms"],
+                                              "last": pos["last"], "gain": pos["last"] / pos["entry"] - 1,
+                                              "exposure": book[-1].get("exposure")},
+            "trades": len(sells), "wins": sum(t["net"] > 0 for t in sells),
+            "recent": [{k: t.get(k) for k in ("close_ms", "action", "symbol", "price", "why", "net", "size")} for t in trades[-10:][::-1]],
+            "scores": [{k: r.get(k) for k in ("symbol", "rank", "alpha", "sigma", "score", "size", "status", "switch_gap")} for r in latest_scores],
+            "scores_ms": newest, "note": mask(str(book[-1].get("note", "")))[:120]}
+
+
 def prediction_summary(root: Path, now_ms: float) -> dict:
     """The live direction predictor's record (predictor/live.py), scored against what happened next."""
     folder = root / "runtime" / "predictor"
@@ -379,6 +421,7 @@ def prediction_summary(root: Path, now_ms: float) -> dict:
         "collected": status.get("collected"), "eight": eight, "relative": relative, "relative_version": newest_relative,
         "size": size_summary(folder),
         "shadow": shadow_summary(folder),
+        "topcoin": topcoin_summary(folder),
         "confident": len(confident), "confident_hits": sum(r["hit"] for r, _ in confident),
         "confident_net": sum(confident_net) / len(confident_net) if confident_net else None,
         "scored": n, "hits": sum(r["hit"] for r, _ in scored), "ups": sum(r["up"] for r, _ in scored),
